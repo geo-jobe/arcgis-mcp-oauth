@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arcgis_sharing_rs::auth::exchange_oauth_authorization_code;
+use arcgis_sharing_rs::auth::{exchange_oauth_authorization_code, exchange_oauth_refresh_token};
 use axum::{
     Json,
     extract::{Query, State},
@@ -180,11 +180,21 @@ impl ArcGISAuthStore {
     }
 
     pub async fn get_token(&self, mcp_access_token: &str) -> Option<McpTokenRecord> {
-        sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ? AND expires_at <= unixepoch()")
-            .bind(mcp_access_token)
-            .execute(&self.pool)
-            .await
-            .ok();
+        if let Ok(result) = sqlx::query(
+            "DELETE FROM tokens WHERE mcp_access_token = ? AND expires_at <= unixepoch()",
+        )
+        .bind(mcp_access_token)
+        .execute(&self.pool)
+        .await
+        {
+            if result.rows_affected() > 0 {
+                sqlx::query("DELETE FROM refresh_tokens WHERE mcp_access_token = ?")
+                    .bind(mcp_access_token)
+                    .execute(&self.pool)
+                    .await
+                    .ok();
+            }
+        }
 
         let row = sqlx::query(
             "SELECT arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
@@ -232,14 +242,12 @@ impl ArcGISAuthStore {
     pub async fn refresh_access_token(
         &self,
         mcp_refresh_token: &str,
-    ) -> Result<(String, String), String> {
-        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-
+    ) -> Result<(String, String, u64), String> {
         let old_access_token: Option<String> = sqlx::query_scalar(
             "SELECT mcp_access_token FROM refresh_tokens WHERE mcp_refresh_token = ?",
         )
         .bind(mcp_refresh_token)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -250,7 +258,7 @@ impl ArcGISAuthStore {
              FROM tokens WHERE mcp_access_token = ?",
         )
         .bind(&old_access_token)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -266,6 +274,52 @@ impl ArcGISAuthStore {
             stories_root: row.get("portal_stories_root"),
         };
 
+        let arcgis_refresh_token = match arcgis_token.refresh_token.as_deref() {
+            Some(token) if !token.is_empty() => token,
+            _ => {
+                Self::cleanup_session(&self.pool, &old_access_token, mcp_refresh_token).await?;
+                return Err("ArcGIS refresh token missing; re-authenticate".into());
+            }
+        };
+
+        let portal_config = self.portal_registry.get(&portal.key).ok_or_else(|| {
+            format!("Portal '{}' not found in registry", portal.key)
+        })?;
+
+        let token_url = format!(
+            "{}/sharing/rest/oauth2/token",
+            portal.portal_url.trim_end_matches('/')
+        );
+
+        let new_arcgis_token = match exchange_oauth_refresh_token(
+            &token_url,
+            &portal_config.client_id,
+            arcgis_refresh_token,
+        )
+        .instrument(tracing::info_span!(
+            "arcgis.token_refresh",
+            "http.request.method" = "POST",
+            "url.full" = %token_url,
+        ))
+        .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                Self::cleanup_session(&self.pool, &old_access_token, mcp_refresh_token).await?;
+                return Err(format!("ArcGIS session expired; re-authenticate: {e}"));
+            }
+        };
+
+        let expires_in = new_arcgis_token.expires_in;
+        let new_token_json =
+            serde_json::to_string(&new_arcgis_token).map_err(|e| e.to_string())?;
+        let expires_at = chrono::Utc::now().timestamp() + expires_in as i64;
+
+        let new_access = format!("mcp-token-{}", Uuid::new_v4());
+        let new_refresh = format!("mcp-refresh-{}", Uuid::new_v4());
+
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+
         sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ?")
             .bind(&old_access_token)
             .execute(&mut *tx)
@@ -277,11 +331,6 @@ impl ArcGISAuthStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
-
-        let new_access = format!("mcp-token-{}", Uuid::new_v4());
-        let new_refresh = format!("mcp-refresh-{}", Uuid::new_v4());
-        let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
-        let new_token_json = serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
 
         sqlx::query(
             "INSERT INTO tokens \
@@ -311,7 +360,30 @@ impl ArcGISAuthStore {
 
         tx.commit().await.map_err(|e| e.to_string())?;
 
-        Ok((new_access, new_refresh))
+        Ok((new_access, new_refresh, expires_in))
+    }
+
+    async fn cleanup_session(
+        pool: &SqlitePool,
+        mcp_access_token: &str,
+        mcp_refresh_token: &str,
+    ) -> Result<(), String> {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+        sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ?")
+            .bind(mcp_access_token)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        sqlx::query("DELETE FROM refresh_tokens WHERE mcp_refresh_token = ?")
+            .bind(mcp_refresh_token)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -385,6 +457,13 @@ pub async fn arcgis_callback(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
+
+    if arcgis_token.refresh_token.is_none() {
+        tracing::warn!(
+            portal = %session.portal.key,
+            "ArcGIS omitted refresh_token; MCP refresh will fail"
+        );
+    }
 
     let username = arcgis_token.username.clone().unwrap_or_default();
     let portal_context = PortalContext::from(&session.portal);

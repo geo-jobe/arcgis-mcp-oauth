@@ -268,14 +268,14 @@ pub async fn oauth_token(
             .refresh_access_token(&token_req.refresh_token)
             .await
         {
-            Ok((new_access, new_refresh)) => {
+            Ok((new_access, new_refresh, expires_in)) => {
                 tracing::info!("Successfully refreshed access token");
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "access_token": new_access,
                         "token_type": "Bearer",
-                        "expires_in": 3600,
+                        "expires_in": expires_in,
                         "refresh_token": new_refresh,
                     })),
                 )
