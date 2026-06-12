@@ -1,0 +1,433 @@
+use std::{collections::HashMap, sync::Arc};
+
+use arcgis_sharing_rs::auth::exchange_oauth_authorization_code;
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Redirect},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqlitePool};
+use tokio::sync::RwLock;
+use tracing::Instrument;
+use uuid::Uuid;
+
+use crate::config::{ArcgisPortalConfig, PortalRegistry};
+
+pub type ArcGISTokenResponse = arcgis_sharing_rs::models::OAuthTokenResponse;
+
+/// Portal context bound to an MCP access token for runtime API calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PortalContext {
+    pub key: String,
+    pub portal_url: String,
+    pub api_root: String,
+    pub portal_apps: String,
+    pub stories_root: String,
+}
+
+impl From<&ArcgisPortalConfig> for PortalContext {
+    fn from(portal: &ArcgisPortalConfig) -> Self {
+        Self {
+            key: portal.key.clone(),
+            portal_url: portal.portal_url.clone(),
+            api_root: portal.api_root.clone(),
+            portal_apps: portal.portal_apps.clone(),
+            stories_root: portal.stories_root.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct McpTokenRecord {
+    pub arcgis_token: ArcGISTokenResponse,
+    pub portal: PortalContext,
+    pub expires_at: i64,
+}
+
+/// Stored when /oauth/authorize/continue is received; consumed by /arcgis/callback.
+#[derive(Clone, Debug)]
+pub struct PendingOAuthSession {
+    pub client_id: String,
+    pub mcp_client_state: Option<String>,
+    pub mcp_redirect_uri: String,
+    pub mcp_code_challenge: Option<String>,
+    pub arcgis_pkce_verifier: Vec<u8>,
+    pub portal: ArcgisPortalConfig,
+}
+
+/// Stored when /arcgis/callback completes; consumed by /oauth/token.
+#[derive(Clone, Debug)]
+pub struct PendingAuthCode {
+    pub arcgis_token: ArcGISTokenResponse,
+    pub client_id: String,
+    pub mcp_code_challenge: Option<String>,
+    pub mcp_redirect_uri: String,
+    pub portal: PortalContext,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArcGISAuthStore {
+    pub base_url: String,
+    pub portal_registry: Arc<PortalRegistry>,
+    pending_oauth_sessions: Arc<RwLock<HashMap<String, PendingOAuthSession>>>,
+    pending_auth_codes: Arc<RwLock<HashMap<String, PendingAuthCode>>>,
+    pool: SqlitePool,
+}
+
+impl ArcGISAuthStore {
+    pub fn new(pool: SqlitePool, base_url: String, portal_registry: PortalRegistry) -> Self {
+        Self {
+            base_url,
+            portal_registry: Arc::new(portal_registry),
+            pending_oauth_sessions: Arc::new(RwLock::new(HashMap::new())),
+            pending_auth_codes: Arc::new(RwLock::new(HashMap::new())),
+            pool,
+        }
+    }
+
+    pub fn portal_registry(&self) -> &PortalRegistry {
+        &self.portal_registry
+    }
+
+    pub async fn create_pending_oauth_session(
+        &self,
+        client_id: String,
+        mcp_client_state: Option<String>,
+        mcp_redirect_uri: String,
+        mcp_code_challenge: Option<String>,
+        portal: ArcgisPortalConfig,
+    ) -> (String, String) {
+        let arcgis_pkce_verifier = generate_pkce_verifier();
+        let arcgis_pkce_challenge = pkce_code_challenge(&arcgis_pkce_verifier);
+        let state_id = Uuid::new_v4().to_string();
+        self.pending_oauth_sessions.write().await.insert(
+            state_id.clone(),
+            PendingOAuthSession {
+                client_id,
+                mcp_client_state,
+                mcp_redirect_uri,
+                mcp_code_challenge,
+                arcgis_pkce_verifier,
+                portal,
+            },
+        );
+        (state_id, arcgis_pkce_challenge)
+    }
+
+    pub async fn consume_pending_oauth_session(
+        &self,
+        state_id: &str,
+    ) -> Option<PendingOAuthSession> {
+        self.pending_oauth_sessions.write().await.remove(state_id)
+    }
+
+    pub async fn store_pending_auth_code(
+        &self,
+        arcgis_token: ArcGISTokenResponse,
+        client_id: String,
+        mcp_code_challenge: Option<String>,
+        mcp_redirect_uri: String,
+        portal: PortalContext,
+    ) -> String {
+        let code = format!("mcp-code-{}", Uuid::new_v4());
+        self.pending_auth_codes.write().await.insert(
+            code.clone(),
+            PendingAuthCode {
+                arcgis_token,
+                client_id,
+                mcp_code_challenge,
+                mcp_redirect_uri,
+                portal,
+            },
+        );
+        code
+    }
+
+    pub async fn consume_pending_auth_code(&self, code: &str) -> Option<PendingAuthCode> {
+        self.pending_auth_codes.write().await.remove(code)
+    }
+
+    pub async fn store_token(
+        &self,
+        mcp_access_token: String,
+        arcgis_token: ArcGISTokenResponse,
+        portal: PortalContext,
+    ) {
+        let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
+        let arcgis_token_json =
+            serde_json::to_string(&arcgis_token).expect("Failed to serialize ArcGIS token");
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO tokens \
+             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&mcp_access_token)
+        .bind(&arcgis_token_json)
+        .bind(expires_at)
+        .bind(&portal.key)
+        .bind(&portal.portal_url)
+        .bind(&portal.api_root)
+        .bind(&portal.portal_apps)
+        .bind(&portal.stories_root)
+        .execute(&self.pool)
+        .await
+        .expect("Failed to store token");
+    }
+
+    pub async fn get_token(&self, mcp_access_token: &str) -> Option<McpTokenRecord> {
+        sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ? AND expires_at <= unixepoch()")
+            .bind(mcp_access_token)
+            .execute(&self.pool)
+            .await
+            .ok();
+
+        let row = sqlx::query(
+            "SELECT arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
+             FROM tokens WHERE mcp_access_token = ?",
+        )
+        .bind(mcp_access_token)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()?;
+
+        let arcgis_token_json: String = row.get("arcgis_token");
+        let arcgis_token: ArcGISTokenResponse = serde_json::from_str(&arcgis_token_json).ok()?;
+        let expires_at: i64 = row.get("expires_at");
+
+        Some(McpTokenRecord {
+            arcgis_token,
+            expires_at,
+            portal: PortalContext {
+                key: row.get("portal_key"),
+                portal_url: row.get("portal_url"),
+                api_root: row.get("portal_api_root"),
+                portal_apps: row.get("portal_apps"),
+                stories_root: row.get("portal_stories_root"),
+            },
+        })
+    }
+
+    pub async fn validate_token(&self, mcp_access_token: &str) -> bool {
+        self.get_token(mcp_access_token).await.is_some()
+    }
+
+    pub async fn store_refresh_token(&self, mcp_refresh_token: String, mcp_access_token: String) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token) \
+             VALUES (?, ?)",
+        )
+        .bind(&mcp_refresh_token)
+        .bind(&mcp_access_token)
+        .execute(&self.pool)
+        .await
+        .expect("Failed to store refresh token");
+    }
+
+    pub async fn refresh_access_token(
+        &self,
+        mcp_refresh_token: &str,
+    ) -> Result<(String, String), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+
+        let old_access_token: Option<String> = sqlx::query_scalar(
+            "SELECT mcp_access_token FROM refresh_tokens WHERE mcp_refresh_token = ?",
+        )
+        .bind(mcp_refresh_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let old_access_token = old_access_token.ok_or("Invalid refresh token")?;
+
+        let row = sqlx::query(
+            "SELECT arcgis_token, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
+             FROM tokens WHERE mcp_access_token = ?",
+        )
+        .bind(&old_access_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let row = row.ok_or("Access token not found for refresh")?;
+        let arcgis_token_json: String = row.get("arcgis_token");
+        let arcgis_token: ArcGISTokenResponse =
+            serde_json::from_str(&arcgis_token_json).map_err(|e| e.to_string())?;
+        let portal = PortalContext {
+            key: row.get("portal_key"),
+            portal_url: row.get("portal_url"),
+            api_root: row.get("portal_api_root"),
+            portal_apps: row.get("portal_apps"),
+            stories_root: row.get("portal_stories_root"),
+        };
+
+        sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ?")
+            .bind(&old_access_token)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        sqlx::query("DELETE FROM refresh_tokens WHERE mcp_refresh_token = ?")
+            .bind(mcp_refresh_token)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let new_access = format!("mcp-token-{}", Uuid::new_v4());
+        let new_refresh = format!("mcp-refresh-{}", Uuid::new_v4());
+        let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
+        let new_token_json = serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "INSERT INTO tokens \
+             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&new_access)
+        .bind(&new_token_json)
+        .bind(expires_at)
+        .bind(&portal.key)
+        .bind(&portal.portal_url)
+        .bind(&portal.api_root)
+        .bind(&portal.portal_apps)
+        .bind(&portal.stories_root)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token) VALUES (?, ?)",
+        )
+        .bind(&new_refresh)
+        .bind(&new_access)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+
+        Ok((new_access, new_refresh))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub code: String,
+    pub state: Option<String>,
+}
+
+pub async fn arcgis_callback(
+    Query(params): Query<CallbackQuery>,
+    State(store): State<Arc<ArcGISAuthStore>>,
+) -> impl IntoResponse {
+    tracing::debug!("arcgis_callback: code present={}", !params.code.is_empty());
+
+    let state_id = match params.state {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            tracing::warn!("arcgis_callback: missing state param");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "missing state parameter" })),
+            )
+                .into_response();
+        }
+    };
+
+    let session = match store.consume_pending_oauth_session(&state_id).await {
+        Some(s) => s,
+        None => {
+            tracing::warn!("arcgis_callback: unknown state={}", state_id);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "unknown or expired state" })),
+            )
+                .into_response();
+        }
+    };
+
+    let verifier_str = match std::str::from_utf8(&session.arcgis_pkce_verifier) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            tracing::warn!("arcgis_callback: pkce verifier is not valid UTF-8");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let server_callback = format!("{}/arcgis/callback", store.base_url);
+    let token_url = format!(
+        "{}/sharing/rest/oauth2/token",
+        session.portal.portal_url.trim_end_matches('/')
+    );
+
+    let arcgis_token: ArcGISTokenResponse = match exchange_oauth_authorization_code(
+        &token_url,
+        &session.portal.client_id,
+        &params.code,
+        &server_callback,
+        &verifier_str,
+    )
+    .instrument(tracing::info_span!(
+        "arcgis.token_exchange",
+        "http.request.method" = "POST",
+        "url.full" = %token_url,
+    ))
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("arcgis_callback: token exchange failed: {}", e);
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let username = arcgis_token.username.clone().unwrap_or_default();
+    let portal_context = PortalContext::from(&session.portal);
+    let mcp_auth_code = store
+        .store_pending_auth_code(
+            arcgis_token,
+            session.client_id,
+            session.mcp_code_challenge,
+            session.mcp_redirect_uri.clone(),
+            portal_context,
+        )
+        .await;
+
+    tracing::info!(
+        "arcgis_callback: stored pending auth code for user={} portal={}",
+        username,
+        session.portal.key
+    );
+
+    let mut redirect_url = format!("{}?code={}", session.mcp_redirect_uri, mcp_auth_code);
+    if let Some(state) = session.mcp_client_state {
+        redirect_url.push_str(&format!("&state={}", percent_encode_component(&state)));
+    }
+    Redirect::to(&redirect_url).into_response()
+}
+
+fn generate_pkce_verifier() -> Vec<u8> {
+    let mut bytes = [0u8; 96];
+    getrandom::fill(&mut bytes).expect("failed to read random bytes for PKCE verifier");
+    URL_SAFE_NO_PAD.encode(bytes).into_bytes()
+}
+
+fn pkce_code_challenge(verifier: &[u8]) -> String {
+    let verifier = std::str::from_utf8(verifier).expect("PKCE verifier must be UTF-8");
+    pkce_challenge_from_verifier(verifier)
+}
+
+pub fn percent_encode_component(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+pub fn pkce_challenge_from_verifier(verifier: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}

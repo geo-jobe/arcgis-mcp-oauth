@@ -4,8 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+askama = "0.14.0"
+arcgis-sharing-rs = { path = "../arcgis-sharing-rs/" }
 axum = "0.8.9"
+base64 = "0.22.1"
+chrono = { version = "0.4.42", features = ["serde"] }
+dotenvy = "0.15.7"
+getrandom = "0.3"
+rmcp = { version = "0.16.0", features = ["auth"] }
 serde = { version = "1.0.228", features = ["derive"] }
-sqlite = "0.37.0"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
-tower-http = { version = "0.6.11", features = ["cors"] }
+serde_json = "1.0.145"
+serde_urlencoded = "0.7.1"
+sha2 = "0.10.8"
+sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-rustls", "migrate", "macros"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8.23"
+tower-http = { version = "0.6.11", features = ["cors", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2"
+uuid = "1.18.1"

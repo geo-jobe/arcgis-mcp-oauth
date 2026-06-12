@@ -1,0 +1,116 @@
+use std::sync::Arc;
+
+use axum::{
+    Router,
+    routing::{get, post},
+};
+use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::arcgis_auth::{ArcGISAuthStore, arcgis_callback};
+use crate::config::Settings;
+use crate::internal::{InternalRouteState, internal_session};
+use crate::oauth::routes::{
+    OAuthRouteState, oauth_authorization_server, oauth_authorize, oauth_authorize_continue,
+    oauth_register, oauth_token,
+};
+use crate::oauth::store::McpOAuthStore;
+use crate::routes::health_check;
+
+pub async fn run(settings: Settings, internal_api_key: String) {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://./data/auth.db".to_string());
+
+    if let Some(path) = database_url.strip_prefix("sqlite://") {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).expect("Failed to create database directory");
+            }
+        }
+    }
+
+    let connect_opts = database_url
+        .parse::<SqliteConnectOptions>()
+        .expect("Invalid DATABASE_URL")
+        .journal_mode(SqliteJournalMode::Wal)
+        .create_if_missing(true);
+
+    let pool = SqlitePool::connect_with(connect_opts)
+        .await
+        .expect("Failed to connect to SQLite database");
+
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("Failed to run database migrations");
+
+    tracing::info!("Database migrations applied");
+
+    let public_base_url = settings.public_base_url.clone();
+    let portal_registry = settings
+        .portal_registry()
+        .expect("Invalid arcgis_portals configuration");
+
+    let mcp_store = Arc::new(McpOAuthStore::new(pool.clone(), &public_base_url));
+    let arcgis_store = Arc::new(ArcGISAuthStore::new(
+        pool,
+        public_base_url.clone(),
+        portal_registry,
+    ));
+
+    let oauth_route_state = Arc::new(OAuthRouteState {
+        mcp_store: mcp_store.clone(),
+        arcgis_store: arcgis_store.clone(),
+    });
+
+    let internal_state = Arc::new(InternalRouteState {
+        oauth: oauth_route_state.clone(),
+        internal_api_key: Arc::new(internal_api_key),
+    });
+
+    let cors_layer = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let oauth_server_router = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_authorization_server).options(oauth_authorization_server),
+        )
+        .route("/oauth/token", post(oauth_token).options(oauth_token))
+        .layer(cors_layer.clone())
+        .with_state(oauth_route_state.clone());
+
+    let arcgis_auth_router = Router::new()
+        .route("/arcgis/callback", get(arcgis_callback))
+        .with_state(arcgis_store);
+
+    let internal_router = Router::new()
+        .route("/internal/session", get(internal_session))
+        .with_state(internal_state);
+
+    let router = Router::new()
+        .route("/health", get(health_check))
+        .route("/oauth/authorize", get(oauth_authorize))
+        .route("/oauth/authorize/continue", get(oauth_authorize_continue))
+        .route("/oauth/register", post(oauth_register))
+        .merge(oauth_server_router)
+        .merge(arcgis_auth_router)
+        .merge(internal_router)
+        .with_state(oauth_route_state)
+        .layer(cors_layer);
+
+    let address = settings
+        .socket_address()
+        .expect("Invalid bind address");
+    tracing::info!("Auth server starting on {}", address);
+
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("Failed to bind to address");
+    axum::serve(listener, router)
+        .await
+        .expect("Server failed");
+}

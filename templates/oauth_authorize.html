@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Choose ArcGIS Portal</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px auto;
+            max-width: 520px;
+            line-height: 1.5;
+            color: #222;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        p {
+            color: #555;
+            margin-top: 0;
+        }
+
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        select {
+            width: 100%;
+            padding: 0.6rem;
+            font-size: 1rem;
+            margin-bottom: 1.25rem;
+        }
+
+        button {
+            background: #0079c1;
+            border: none;
+            color: #fff;
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0.65rem 1rem;
+            border-radius: 4px;
+        }
+
+        button:hover {
+            background: #005e95;
+        }
+    </style>
+</head>
+<body>
+    <h1>Choose ArcGIS Portal</h1>
+    <p>Select the portal you want to sign in with, then continue to ArcGIS login.</p>
+
+    <form method="get" action="{{ continue_url }}">
+        <input type="hidden" name="response_type" value="{{ response_type }}">
+        <input type="hidden" name="client_id" value="{{ client_id }}">
+        <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+        {% if let Some(scope) = scope %}
+        <input type="hidden" name="scope" value="{{ scope }}">
+        {% endif %}
+        {% if let Some(state) = state %}
+        <input type="hidden" name="state" value="{{ state }}">
+        {% endif %}
+        {% if let Some(code_challenge) = code_challenge %}
+        <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
+        {% endif %}
+        {% if let Some(code_challenge_method) = code_challenge_method %}
+        <input type="hidden" name="code_challenge_method" value="{{ code_challenge_method }}">
+        {% endif %}
+
+        <label for="portal_key">Portal</label>
+        <select id="portal_key" name="portal_key" required>
+            {% for portal in portals %}
+            <option value="{{ portal.key }}">{{ portal.label }}</option>
+            {% endfor %}
+        </select>
+
+        <button type="submit">Continue to ArcGIS Login</button>
+    </form>
+</body>
+</html>
