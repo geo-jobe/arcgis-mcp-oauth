@@ -1,0 +1,25 @@
+services:
+  micro-auth:
+    container_name: micro-auth
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      AUTH_ADDRESS: 0.0.0.0
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "${AUTH_PORT:-3324}:3324"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3324/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - arcgis-mcp
+
+networks:
+  arcgis-mcp:
+    name: arcgis-mcp

@@ -1,0 +1,9 @@
+# Ignore everything by default
+*
+
+# Allow runtime inputs
+!config/
+!config/**
+!target/release/micro-auth
+!Dockerfile
+!.dockerignore
