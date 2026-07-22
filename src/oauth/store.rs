@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
 /// Request body for POST /oauth/token.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct TokenRequest {
     pub grant_type: String,
     #[serde(default)]
@@ -15,6 +15,27 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
     #[serde(default)]
     pub refresh_token: String,
+}
+
+impl std::fmt::Debug for TokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenRequest")
+            .field("grant_type", &self.grant_type)
+            .field("code", &redact_if_present(&self.code))
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("code_verifier", &self.code_verifier.as_ref().map(|_| "<redacted>"))
+            .field("refresh_token", &redact_if_present(&self.refresh_token))
+            .finish()
+    }
+}
+
+fn redact_if_present(value: &str) -> &str {
+    if value.is_empty() {
+        "<empty>"
+    } else {
+        "<redacted>"
+    }
 }
 
 /// Query parameters for GET /oauth/authorize.

@@ -32,6 +32,7 @@ RUN mkdir -p /app/data && \
 
 USER appuser
 
+ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 EXPOSE 3324

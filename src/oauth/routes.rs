@@ -227,7 +227,10 @@ pub async fn oauth_token(
     };
 
     let token_req = match serde_urlencoded::from_bytes::<TokenRequest>(&bytes) {
-        Ok(form) => form,
+        Ok(form) => {
+            tracing::trace!(request = ?form, "parsed token request");
+            form
+        }
         Err(e) => {
             tracing::error!("can't parse form data: {}", e);
             return (
@@ -316,7 +319,7 @@ pub async fn oauth_token(
     {
         Some(p) => p,
         None => {
-            tracing::error!("Auth code not found: {}", token_req.code);
+            tracing::error!("Auth code not found or already used");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({

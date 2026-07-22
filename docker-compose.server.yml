@@ -5,6 +5,7 @@ services:
     env_file: .env
     environment:
       AUTH_ADDRESS: 0.0.0.0
+      RUST_LOG: info
     volumes:
       - auth-data:/app/data
     ports:

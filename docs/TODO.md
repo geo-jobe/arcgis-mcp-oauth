@@ -11,21 +11,14 @@ uses constant-time comparison.
 
 ## Critical — fix before any public release
 
-- [ ] **Token credentials logged in plaintext.** `src/oauth/routes.rs` logs the
-  raw token request body and the parsed `TokenRequest` (derives `Debug`) at
-  `INFO`, leaking `code`, `code_verifier`, and `refresh_token` on every token
-  exchange. Drop to `trace!` and redact/remove secret fields.
-  - `tracing::info!("request body: {}", body_str);`
-  - `tracing::info!("successfully parsed form data: {:?}", form);`
+- [x] **Token credentials logged in plaintext.** `TokenRequest` uses a redacted
+  `Debug` impl; token parsing logs at `trace!` only (no raw body at `INFO`).
 
-- [ ] **Default log level is `debug` in production.** `src/main.rs` falls back to
-  `arcgis_mcp_oauth=debug` and the Dockerfile never sets `RUST_LOG`, so prod runs at
-  debug (amplifies the leak above). Set a sane per-env default and export
-  `RUST_LOG=info` in Docker/compose.
+- [x] **Default log level is `debug` in production.** `src/main.rs` defaults to
+  `info`; Dockerfile and compose set `RUST_LOG=info`.
 
-- [ ] **Path dependency breaks external builds.** `Cargo.toml` has
-  `arcgis-sharing-rs = { path = "../arcgis-sharing-rs/" }`; `git clone && cargo build`
-  fails for everyone. Publish to crates.io or use a git dependency pinned to a rev.
+- [x] **Path dependency breaks external builds.** `arcgis-sharing-rs` is a git
+  dependency pinned to a rev in `Cargo.toml`.
 
 - [ ] **Auth codes / pending sessions never expire (security + DoS).**
   `pending_oauth_sessions` and `pending_auth_codes` in `src/arcgis_auth.rs` are

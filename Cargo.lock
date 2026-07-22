@@ -71,7 +71,7 @@ dependencies = [
 [[package]]
 name = "arcgis-sharing-rs"
 version = "0.1.0"
-source = "git+https://github.com/skyler-favors/arcgis-api-rs.git?branch=main#656db2d7a4398be819596c0cf23e71f7a543c1f9"
+source = "git+https://github.com/skyler-favors/arcgis-api-rs.git?rev=656db2d7a4398be819596c0cf23e71f7a543c1f9#656db2d7a4398be819596c0cf23e71f7a543c1f9"
 dependencies = [
  "arc-swap",
  "async-trait",
