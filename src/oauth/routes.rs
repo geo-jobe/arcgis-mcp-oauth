@@ -20,6 +20,9 @@ use crate::arcgis_auth::{
 use crate::config::ArcgisPortalConfig;
 use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, RegisterError, TokenRequest};
 
+/// Max bytes for `/oauth/token` form body (grant_type, code, PKCE, redirect_uri, etc.).
+const OAUTH_TOKEN_MAX_BODY: usize = 4096;
+
 #[derive(Template)]
 #[template(path = "oauth_authorize.html")]
 struct AuthorizeTemplate {
@@ -227,7 +230,7 @@ pub async fn oauth_token(
     State(state): State<Arc<OAuthRouteState>>,
     request: axum::http::Request<Body>,
 ) -> impl IntoResponse {
-    let bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+    let bytes = match axum::body::to_bytes(request.into_body(), OAUTH_TOKEN_MAX_BODY).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("can't read request body: {}", e);

@@ -38,9 +38,8 @@ uses constant-time comparison.
   compares `token_req.redirect_uri` against stored `pending.mcp_redirect_uri`
   (RFC 6749 §4.1.3).
 
-- [ ] **Unbounded request body.** `axum::body::to_bytes(request.into_body(), usize::MAX)`
-  in `oauth_token` lets a client stream an arbitrarily large body into memory.
-  Cap it (a few KB is enough for a token request).
+- [x] **Unbounded request body.** `oauth_token` now caps the body at 4 KB via
+  `OAUTH_TOKEN_MAX_BODY` (enough for grant_type, code, PKCE, redirect_uri, etc.).
 
 ## Medium — OSS hygiene / correctness
 
