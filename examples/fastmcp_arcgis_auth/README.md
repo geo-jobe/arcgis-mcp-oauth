@@ -1,13 +1,13 @@
-# FastMCP + micro-auth
+# FastMCP + arcgis-mcp-oauth
 
 This example is a small Python MCP resource server that accepts
-`mcp-token-*` bearer tokens issued by `micro-auth`.
+`mcp-token-*` bearer tokens issued by `arcgis-mcp-oauth`.
 
 It demonstrates:
 
 1. FastMCP's Streamable HTTP transport at `POST /mcp`.
 2. Starlette middleware that validates the client bearer token with
-   `micro-auth`.
+   `arcgis-mcp-oauth`.
 3. Protected-resource metadata at
    `/.well-known/oauth-protected-resource`.
 4. Reading the resolved ArcGIS access token and portal context in a FastMCP
@@ -15,7 +15,7 @@ It demonstrates:
 
 ## Install and run
 
-Start `micro-auth` first, then install the example dependencies:
+Start `arcgis-mcp-oauth` first, then install the example dependencies:
 
 ```bash
 cd examples/fastmcp_arcgis_auth
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 
 export AUTH_SERVICE_URL=http://localhost:3324
 export MCP_PUBLIC_BASE_URL=http://localhost:3325
-export INTERNAL_API_KEY=the-same-value-used-by-micro-auth
+export INTERNAL_API_KEY=the-same-value-used-by-arcgis-mcp-oauth
 python server.py
 ```
 
@@ -40,7 +40,7 @@ The MCP client sends its token to this resource server:
 Authorization: Bearer mcp-token-...
 ```
 
-The server then calls `micro-auth`:
+The server then calls `arcgis-mcp-oauth`:
 
 ```http
 GET /internal/session
@@ -48,7 +48,7 @@ Authorization: Bearer <INTERNAL_API_KEY>
 X-MCP-Access-Token: mcp-token-...
 ```
 
-`INTERNAL_API_KEY` belongs only to the resource server and `micro-auth`; it
+`INTERNAL_API_KEY` belongs only to the resource server and `arcgis-mcp-oauth`; it
 must never be sent to an MCP client. The middleware caches the resolved ArcGIS
 session only on the current request. The example's tool uses the ArcGIS access
 token to request `/community/self` and deliberately does not return it.
@@ -62,7 +62,7 @@ An unauthenticated `/mcp` request receives a `401` with a
 http://localhost:3325/.well-known/oauth-protected-resource
 ```
 
-That metadata identifies `micro-auth` as the authorization server, allowing an
+That metadata identifies `arcgis-mcp-oauth` as the authorization server, allowing an
 MCP client to begin the OAuth flow.
 
 ## Check

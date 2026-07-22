@@ -4,6 +4,6 @@
 # Allow runtime inputs
 !config/
 !config/**
-!target/release/micro-auth
+!target/release/arcgis-mcp-oauth
 !Dockerfile
 !.dockerignore

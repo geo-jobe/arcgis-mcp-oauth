@@ -1,4 +1,4 @@
-# micro-auth — Production OSS Release TODO
+# arcgis-mcp-oauth — Production OSS Release TODO
 
 Findings from a read-only review of the codebase (Rust OAuth 2.0 authorization
 server, Axum + SQLite, ~1.5k LOC) for production open-source release.
@@ -19,7 +19,7 @@ uses constant-time comparison.
   - `tracing::info!("successfully parsed form data: {:?}", form);`
 
 - [ ] **Default log level is `debug` in production.** `src/main.rs` falls back to
-  `micro_auth=debug` and the Dockerfile never sets `RUST_LOG`, so prod runs at
+  `arcgis_mcp_oauth=debug` and the Dockerfile never sets `RUST_LOG`, so prod runs at
   debug (amplifies the leak above). Set a sane per-env default and export
   `RUST_LOG=info` in Docker/compose.
 

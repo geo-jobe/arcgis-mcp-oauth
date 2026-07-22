@@ -1,6 +1,6 @@
-# Runtime-only image for micro-auth.
+# Runtime-only image for arcgis-mcp-oauth.
 # Build the release binary on the host first: cargo build --release
-# Then package: docker build -t micro-auth .
+# Then package: docker build -t arcgis-mcp-oauth .
 
 FROM ubuntu:24.04
 #FROM debian:bookworm-slim # GLIBC_2.36
@@ -23,7 +23,7 @@ RUN if id ubuntu &>/dev/null; then \
 
 WORKDIR /app
 
-COPY target/release/micro-auth /app/micro-auth
+COPY target/release/arcgis-mcp-oauth /app/arcgis-mcp-oauth
 
 COPY config /app/config
 
@@ -36,4 +36,4 @@ ENV RUST_BACKTRACE=1
 
 EXPOSE 3324
 
-CMD ["/app/micro-auth"]
+CMD ["/app/arcgis-mcp-oauth"]

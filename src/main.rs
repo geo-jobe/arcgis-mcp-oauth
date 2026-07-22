@@ -10,7 +10,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "micro_auth=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "arcgis_mcp_oauth=debug,tower_http=debug".into()),
         )
         .init();
 

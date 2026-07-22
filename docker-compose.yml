@@ -1,6 +1,6 @@
 services:
-  micro-auth:
-    container_name: micro-auth
+  arcgis-mcp-oauth:
+    container_name: arcgis-mcp-oauth
     build:
       context: .
       dockerfile: Dockerfile

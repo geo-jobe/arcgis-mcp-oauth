@@ -1,7 +1,7 @@
 services:
-  micro-auth:
-    container_name: micro-auth
-    image: micro-auth:latest
+  arcgis-mcp-oauth:
+    container_name: arcgis-mcp-oauth
+    image: arcgis-mcp-oauth:latest
     env_file: .env
     environment:
       AUTH_ADDRESS: 0.0.0.0

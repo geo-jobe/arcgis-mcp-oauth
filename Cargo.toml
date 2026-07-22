@@ -1,5 +1,5 @@
 [package]
-name = "micro-auth"
+name = "arcgis-mcp-oauth"
 version = "0.1.0"
 edition = "2024"
 description = "OAuth 2.0 authorization server for ArcGIS MCP services"

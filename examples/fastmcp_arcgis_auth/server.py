@@ -1,4 +1,4 @@
-"""A minimal FastMCP resource server protected by micro-auth."""
+"""A minimal FastMCP resource server protected by arcgis-mcp-oauth."""
 
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ class MicroAuthClient:
 
 
 class MCPBearerAuthMiddleware(BaseHTTPMiddleware):
-    """Require a valid micro-auth MCP access token for every /mcp request."""
+    """Require a valid arcgis-mcp-oauth MCP access token for every /mcp request."""
 
     def __init__(
         self,
