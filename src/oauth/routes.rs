@@ -211,8 +211,6 @@ pub async fn oauth_token(
     State(state): State<Arc<OAuthRouteState>>,
     request: axum::http::Request<Body>,
 ) -> impl IntoResponse {
-    tracing::info!("Received token request");
-
     let bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -228,14 +226,8 @@ pub async fn oauth_token(
         }
     };
 
-    let body_str = String::from_utf8_lossy(&bytes);
-    tracing::info!("request body: {}", body_str);
-
     let token_req = match serde_urlencoded::from_bytes::<TokenRequest>(&bytes) {
-        Ok(form) => {
-            tracing::info!("successfully parsed form data: {:?}", form);
-            form
-        }
+        Ok(form) => form,
         Err(e) => {
             tracing::error!("can't parse form data: {}", e);
             return (

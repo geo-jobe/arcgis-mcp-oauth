@@ -19,15 +19,14 @@ use crate::oauth::store::McpOAuthStore;
 use crate::routes::health_check;
 
 pub async fn run(settings: Settings, internal_api_key: String) {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://./data/auth.db".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://./data/auth.db".to_string());
 
-    if let Some(path) = database_url.strip_prefix("sqlite://") {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).expect("Failed to create database directory");
-            }
-        }
+    if let Some(path) = database_url.strip_prefix("sqlite://")
+        && let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).expect("Failed to create database directory");
     }
 
     let connect_opts = database_url
@@ -102,15 +101,11 @@ pub async fn run(settings: Settings, internal_api_key: String) {
         .with_state(oauth_route_state)
         .layer(cors_layer);
 
-    let address = settings
-        .socket_address()
-        .expect("Invalid bind address");
+    let address = settings.socket_address().expect("Invalid bind address");
     tracing::info!("Auth server starting on {}", address);
 
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("Failed to bind to address");
-    axum::serve(listener, router)
-        .await
-        .expect("Server failed");
+    axum::serve(listener, router).await.expect("Server failed");
 }
