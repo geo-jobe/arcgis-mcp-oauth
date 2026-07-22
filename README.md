@@ -10,11 +10,21 @@ The sibling [arcgis-mcp-rs](../arcgis-mcp-rs/) project is the MCP resource serve
 
 ```bash
 cp .env.example .env
+cp config/local.example.toml config/local.toml
 ```
 
 Set `INTERNAL_API_KEY` to a shared secret (must match mcp-rs).
 
-### 2. Start micro-auth
+### 2. Configure an ArcGIS portal
+
+Replace the placeholder portal in `config/local.toml` with the details for
+your ArcGIS OAuth application. Its redirect URI must be:
+
+```
+http://localhost:3324/arcgis/callback
+```
+
+### 3. Start micro-auth
 
 ```bash
 cd micro-auth
@@ -23,7 +33,7 @@ INTERNAL_API_KEY=dev-secret cargo run
 
 Listens on `http://localhost:3324` by default (`config/local.toml`).
 
-### 3. Start mcp-rs
+### 4. Start mcp-rs
 
 ```bash
 cd ../arcgis-mcp-rs
@@ -34,21 +44,13 @@ cargo run
 
 Listens on `http://localhost:3325`.
 
-### 4. OAuth flow
+### 5. OAuth flow
 
 1. Discover AS: `GET http://localhost:3325/.well-known/oauth-protected-resource`
 2. Register client: `POST http://localhost:3324/oauth/register`
 3. Open authorize URL in browser (portal picker → ArcGIS login)
 4. Exchange code: `POST http://localhost:3324/oauth/token`
 5. Call MCP with `Authorization: Bearer mcp-token-...` on `http://localhost:3325/mcp`
-
-### ArcGIS portal setup
-
-Each portal in `config/local.toml` needs an OAuth application with redirect URI:
-
-```
-http://localhost:3324/arcgis/callback
-```
 
 ## Endpoints
 
