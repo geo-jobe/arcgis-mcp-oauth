@@ -34,9 +34,9 @@ uses constant-time comparison.
   runs *after* the auth code is consumed, so a failure burns the code with no
   token issued (user stuck). Return proper `500`s; consider a `CatchPanicLayer`.
 
-- [ ] **`redirect_uri` not verified at token exchange.** `/oauth/token` never
+- [x] **`redirect_uri` not verified at token exchange.** `/oauth/token` now
   compares `token_req.redirect_uri` against stored `pending.mcp_redirect_uri`
-  (RFC 6749 §4.1.3). PKCE mitigates the main attack, but close the gap.
+  (RFC 6749 §4.1.3).
 
 - [ ] **Unbounded request body.** `axum::body::to_bytes(request.into_body(), usize::MAX)`
   in `oauth_token` lets a client stream an arbitrarily large body into memory.

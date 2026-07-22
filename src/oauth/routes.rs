@@ -363,6 +363,32 @@ pub async fn oauth_token(
             .into_response();
     }
 
+    if token_req.redirect_uri.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_request",
+                "error_description": "redirect_uri is required"
+            })),
+        )
+            .into_response();
+    }
+    if token_req.redirect_uri != pending.mcp_redirect_uri {
+        tracing::warn!(
+            "oauth_token: redirect_uri mismatch: got={} expected={}",
+            token_req.redirect_uri,
+            pending.mcp_redirect_uri
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "redirect_uri does not match the authorization request"
+            })),
+        )
+            .into_response();
+    }
+
     if let Some(challenge) = &pending.mcp_code_challenge {
         match &token_req.code_verifier {
             Some(verifier) => {
