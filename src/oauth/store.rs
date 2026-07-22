@@ -1,5 +1,13 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use tokio::sync::RwLock;
+
+// Fixed caps; upgrade path is env-config or per-IP limits at the proxy.
+const MAX_REGISTERED_CLIENTS: i64 = 1000;
+const MAX_REGISTRATIONS_PER_MINUTE: usize = 10;
+const REGISTRATION_RATE_WINDOW_SECS: i64 = 60;
 
 /// Request body for POST /oauth/token.
 #[derive(Deserialize, Serialize)]
@@ -58,11 +66,18 @@ pub struct RegisteredClient {
     pub client_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterError {
+    CapacityExceeded,
+    RateLimited,
+}
+
 /// Carries the server's public address for discovery metadata and the DCR client registry.
 #[derive(Clone, Debug)]
 pub struct McpOAuthStore {
     pub app_address: String,
     pool: SqlitePool,
+    registration_timestamps: Arc<RwLock<Vec<i64>>>,
 }
 
 impl McpOAuthStore {
@@ -70,6 +85,7 @@ impl McpOAuthStore {
         Self {
             app_address: app_address.to_string(),
             pool,
+            registration_timestamps: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -79,7 +95,25 @@ impl McpOAuthStore {
         client_id: String,
         redirect_uris: Vec<String>,
         client_name: Option<String>,
-    ) {
+    ) -> Result<(), RegisterError> {
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut timestamps = self.registration_timestamps.write().await;
+            timestamps.retain(|&ts| now - ts < REGISTRATION_RATE_WINDOW_SECS);
+            if timestamps.len() >= MAX_REGISTRATIONS_PER_MINUTE {
+                return Err(RegisterError::RateLimited);
+            }
+            timestamps.push(now);
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM registered_clients")
+            .fetch_one(&self.pool)
+            .await
+            .expect("Failed to count registered clients");
+        if count >= MAX_REGISTERED_CLIENTS {
+            return Err(RegisterError::CapacityExceeded);
+        }
+
         let redirect_uris_json =
             serde_json::to_string(&redirect_uris).expect("Failed to serialize redirect_uris");
 
@@ -93,6 +127,8 @@ impl McpOAuthStore {
         .execute(&self.pool)
         .await
         .expect("Failed to register client");
+
+        Ok(())
     }
 
     /// Look up a previously registered client. Returns `None` if the `client_id` is unknown.

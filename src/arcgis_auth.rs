@@ -17,7 +17,22 @@ use uuid::Uuid;
 
 use crate::config::{ArcgisPortalConfig, PortalRegistry};
 
+// Fixed TTLs/caps; upgrade path is env-config or per-IP rate limiting at the proxy.
+const PENDING_OAUTH_SESSION_TTL_SECS: i64 = 600;
+const PENDING_AUTH_CODE_TTL_SECS: i64 = 600;
+const MAX_PENDING_OAUTH_SESSIONS: usize = 1000;
+const MAX_PENDING_AUTH_CODES: usize = 1000;
+
 pub type ArcGISTokenResponse = arcgis_sharing_rs::models::OAuthTokenResponse;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingStoreError {
+    CapacityExceeded,
+}
+
+fn is_expired(created_at: i64, ttl_secs: i64) -> bool {
+    chrono::Utc::now().timestamp() > created_at + ttl_secs
+}
 
 /// Portal context bound to an MCP access token for runtime API calls.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -57,6 +72,7 @@ pub struct PendingOAuthSession {
     pub mcp_code_challenge: Option<String>,
     pub arcgis_pkce_verifier: Vec<u8>,
     pub portal: ArcgisPortalConfig,
+    pub created_at: i64,
 }
 
 /// Stored when /arcgis/callback completes; consumed by /oauth/token.
@@ -67,6 +83,7 @@ pub struct PendingAuthCode {
     pub mcp_code_challenge: Option<String>,
     pub mcp_redirect_uri: String,
     pub portal: PortalContext,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -100,11 +117,16 @@ impl ArcGISAuthStore {
         mcp_redirect_uri: String,
         mcp_code_challenge: Option<String>,
         portal: ArcgisPortalConfig,
-    ) -> (String, String) {
+    ) -> Result<(String, String), PendingStoreError> {
         let arcgis_pkce_verifier = generate_pkce_verifier();
         let arcgis_pkce_challenge = pkce_code_challenge(&arcgis_pkce_verifier);
         let state_id = Uuid::new_v4().to_string();
-        self.pending_oauth_sessions.write().await.insert(
+        let created_at = chrono::Utc::now().timestamp();
+        let mut sessions = self.pending_oauth_sessions.write().await;
+        if sessions.len() >= MAX_PENDING_OAUTH_SESSIONS {
+            return Err(PendingStoreError::CapacityExceeded);
+        }
+        sessions.insert(
             state_id.clone(),
             PendingOAuthSession {
                 client_id,
@@ -113,16 +135,21 @@ impl ArcGISAuthStore {
                 mcp_code_challenge,
                 arcgis_pkce_verifier,
                 portal,
+                created_at,
             },
         );
-        (state_id, arcgis_pkce_challenge)
+        Ok((state_id, arcgis_pkce_challenge))
     }
 
     pub async fn consume_pending_oauth_session(
         &self,
         state_id: &str,
     ) -> Option<PendingOAuthSession> {
-        self.pending_oauth_sessions.write().await.remove(state_id)
+        let session = self.pending_oauth_sessions.write().await.remove(state_id)?;
+        if is_expired(session.created_at, PENDING_OAUTH_SESSION_TTL_SECS) {
+            return None;
+        }
+        Some(session)
     }
 
     pub async fn store_pending_auth_code(
@@ -132,9 +159,14 @@ impl ArcGISAuthStore {
         mcp_code_challenge: Option<String>,
         mcp_redirect_uri: String,
         portal: PortalContext,
-    ) -> String {
+    ) -> Result<String, PendingStoreError> {
         let code = format!("mcp-code-{}", Uuid::new_v4());
-        self.pending_auth_codes.write().await.insert(
+        let created_at = chrono::Utc::now().timestamp();
+        let mut codes = self.pending_auth_codes.write().await;
+        if codes.len() >= MAX_PENDING_AUTH_CODES {
+            return Err(PendingStoreError::CapacityExceeded);
+        }
+        codes.insert(
             code.clone(),
             PendingAuthCode {
                 arcgis_token,
@@ -142,13 +174,41 @@ impl ArcGISAuthStore {
                 mcp_code_challenge,
                 mcp_redirect_uri,
                 portal,
+                created_at,
             },
         );
-        code
+        Ok(code)
     }
 
     pub async fn consume_pending_auth_code(&self, code: &str) -> Option<PendingAuthCode> {
-        self.pending_auth_codes.write().await.remove(code)
+        let pending = self.pending_auth_codes.write().await.remove(code)?;
+        if is_expired(pending.created_at, PENDING_AUTH_CODE_TTL_SECS) {
+            return None;
+        }
+        Some(pending)
+    }
+
+    pub async fn sweep_expired(&self) {
+        let before_sessions = {
+            let mut sessions = self.pending_oauth_sessions.write().await;
+            let before = sessions.len();
+            sessions
+                .retain(|_, s| !is_expired(s.created_at, PENDING_OAUTH_SESSION_TTL_SECS));
+            before - sessions.len()
+        };
+        let before_codes = {
+            let mut codes = self.pending_auth_codes.write().await;
+            let before = codes.len();
+            codes.retain(|_, c| !is_expired(c.created_at, PENDING_AUTH_CODE_TTL_SECS));
+            before - codes.len()
+        };
+        if before_sessions > 0 || before_codes > 0 {
+            tracing::debug!(
+                expired_sessions = before_sessions,
+                expired_codes = before_codes,
+                "swept expired pending OAuth state"
+            );
+        }
     }
 
     pub async fn store_token(
@@ -467,7 +527,7 @@ pub async fn arcgis_callback(
 
     let username = arcgis_token.username.clone().unwrap_or_default();
     let portal_context = PortalContext::from(&session.portal);
-    let mcp_auth_code = store
+    let mcp_auth_code = match store
         .store_pending_auth_code(
             arcgis_token,
             session.client_id,
@@ -475,7 +535,14 @@ pub async fn arcgis_callback(
             session.mcp_redirect_uri.clone(),
             portal_context,
         )
-        .await;
+        .await
+    {
+        Ok(code) => code,
+        Err(PendingStoreError::CapacityExceeded) => {
+            tracing::warn!("arcgis_callback: pending auth code capacity exceeded");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
 
     tracing::info!(
         "arcgis_callback: stored pending auth code for user={} portal={}",
@@ -509,4 +576,21 @@ pub fn pkce_challenge_from_verifier(verifier: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_expired;
+
+    #[test]
+    fn is_expired_false_within_ttl() {
+        let created_at = chrono::Utc::now().timestamp() - 300;
+        assert!(!is_expired(created_at, 600));
+    }
+
+    #[test]
+    fn is_expired_true_past_ttl() {
+        let created_at = chrono::Utc::now().timestamp() - 601;
+        assert!(is_expired(created_at, 600));
+    }
 }

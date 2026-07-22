@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -57,6 +58,15 @@ pub async fn run(settings: Settings, internal_api_key: String) {
         public_base_url.clone(),
         portal_registry,
     ));
+
+    let sweep_store = arcgis_store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            sweep_store.sweep_expired().await;
+        }
+    });
 
     let oauth_route_state = Arc::new(OAuthRouteState {
         mcp_store: mcp_store.clone(),

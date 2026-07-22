@@ -20,12 +20,11 @@ uses constant-time comparison.
 - [x] **Path dependency breaks external builds.** `arcgis-sharing-rs` is a git
   dependency pinned to a rev in `Cargo.toml`.
 
-- [ ] **Auth codes / pending sessions never expire (security + DoS).**
-  `pending_oauth_sessions` and `pending_auth_codes` in `src/arcgis_auth.rs` are
-  in-memory `HashMap`s with no TTL or cleanup. Auth codes must be short-lived
-  (≤10 min, OAuth spec). Also unbounded: `/oauth/authorize/continue` and the open
-  `/oauth/register` (DCR) let anyone grow the maps and `registered_clients` table
-  without limit. Add expiry + periodic sweep; cap/rate-limit registration.
+- [x] **Auth codes / pending sessions never expire (security + DoS).**
+  `pending_oauth_sessions` and `pending_auth_codes` in `src/arcgis_auth.rs` now
+  carry 10-minute TTLs, enforce expiry on consume, sweep every 60s, and cap map
+  size at 1000. DCR (`/oauth/register`) is capped at 1000 clients and rate-limited
+  to 10 registrations per minute per process.
 
 ## High — should fix
 

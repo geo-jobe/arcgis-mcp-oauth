@@ -14,9 +14,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::arcgis_auth::{ArcGISAuthStore, percent_encode_component, pkce_challenge_from_verifier};
+use crate::arcgis_auth::{
+    ArcGISAuthStore, PendingStoreError, percent_encode_component, pkce_challenge_from_verifier,
+};
 use crate::config::ArcgisPortalConfig;
-use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, TokenRequest};
+use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, RegisterError, TokenRequest};
 
 #[derive(Template)]
 #[template(path = "oauth_authorize.html")]
@@ -179,7 +181,7 @@ pub async fn oauth_authorize_continue(
         }
     };
 
-    let (arcgis_state_id, arcgis_pkce_challenge) = state
+    let (arcgis_state_id, arcgis_pkce_challenge) = match state
         .arcgis_store
         .create_pending_oauth_session(
             params.client_id,
@@ -188,7 +190,21 @@ pub async fn oauth_authorize_continue(
             params.code_challenge,
             portal.clone(),
         )
-        .await;
+        .await
+    {
+        Ok(ids) => ids,
+        Err(PendingStoreError::CapacityExceeded) => {
+            tracing::warn!("oauth_authorize_continue: pending session capacity exceeded");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "authorization session limit reached"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let server_callback = format!("{}/arcgis/callback", state.mcp_store.app_address);
     let portal_base = portal.portal_url.trim_end_matches('/');
@@ -428,14 +444,34 @@ pub async fn oauth_register(
     Json(body): Json<RegistrationRequest>,
 ) -> impl IntoResponse {
     let client_id = Uuid::new_v4().to_string();
-    state
+    if let Err(err) = state
         .mcp_store
         .register_client(
             client_id.clone(),
             body.redirect_uris.clone(),
             body.client_name.clone(),
         )
-        .await;
+        .await
+    {
+        return match err {
+            RegisterError::CapacityExceeded => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "client registration limit reached"
+                })),
+            )
+                .into_response(),
+            RegisterError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "slow_down",
+                    "error_description": "too many registration requests"
+                })),
+            )
+                .into_response(),
+        };
+    }
     tracing::info!(
         "Dynamic client registration: client_id={}, redirect_uris={:?}",
         client_id,
@@ -450,4 +486,5 @@ pub async fn oauth_register(
             "token_endpoint_auth_method": "none",
         })),
     )
+        .into_response()
 }
