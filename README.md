@@ -1,6 +1,30 @@
-# micro-auth
+# arcgis-mcp-oauth
 
 OAuth 2.0 authorization server for the ArcGIS MCP stack. Brokers a double-PKCE flow against ArcGIS Online/Enterprise and issues opaque `mcp-token-*` bearer tokens.
+
+**What is it?**
+'Micro-Auth' is a small authorization server we built specifically for ArcGIS MCP integrations. Its one job is to broker the OAuth handshake between an MCP client (Cursor, Claude Desktop, etc.) and ArcGIS, then hand back a bearer token the MCP server can actually use.
+
+**Why it exists**
+We noticed lots of people in this space struggling to integrate MCP effectively with ArcGIS. The most common example is hard-coded API key's or service accounts, which restricts the service and adds potential security risks. This solves that by issue for you.
+
+**How it works**
+You point your MCP server at micro-auth. When a user connects through their MCP client, micro-auth handles the ArcGIS login, they authenticate through a normal browser-based ArcGIS OAuth flow. From that point on, your MCP server just calls a single internal endpoint to get a live, user-scoped ArcGIS token whenever it needs one.
+
+[PRM Document Example](https://modelcontextprotocol.io/docs/tutorials/security/autho)
+
+Example authorization middleware
+```rust
+fn auth_middleware() {
+    let mcp_token = request.headers().get("Authorization");
+
+    if validate_token(mcp_token).await {
+        "MCP token validated successfully"
+    } else {
+        "Auth validation failed for token"
+    }
+}
+```
 
 The sibling [arcgis-mcp-rs](../arcgis-mcp-rs/) project is the MCP resource server — it validates tokens via this service's `/internal/session` endpoint.
 
