@@ -407,18 +407,26 @@ pub async fn oauth_token(
     let mcp_access_token = format!("mcp-token-{}", Uuid::new_v4());
     let mcp_refresh_token = format!("mcp-refresh-{}", Uuid::new_v4());
 
-    state
+    if let Err(e) = state
         .arcgis_store
-        .store_token(
+        .store_issued_tokens(
             mcp_access_token.clone(),
+            mcp_refresh_token.clone(),
             pending.arcgis_token,
             pending.portal,
         )
-        .await;
-    state
-        .arcgis_store
-        .store_refresh_token(mcp_refresh_token.clone(), mcp_access_token.clone())
-        .await;
+        .await
+    {
+        tracing::error!("Failed to store issued tokens: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "server_error",
+                "error_description": "failed to persist token"
+            })),
+        )
+            .into_response();
+    }
 
     tracing::info!("successfully issued mcp access token");
     (
@@ -467,6 +475,14 @@ pub async fn oauth_register(
                 Json(serde_json::json!({
                     "error": "slow_down",
                     "error_description": "too many registration requests"
+                })),
+            )
+                .into_response(),
+            RegisterError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "failed to register client"
                 })),
             )
                 .into_response(),

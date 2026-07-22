@@ -211,15 +211,18 @@ impl ArcGISAuthStore {
         }
     }
 
-    pub async fn store_token(
+    pub async fn store_issued_tokens(
         &self,
         mcp_access_token: String,
+        mcp_refresh_token: String,
         arcgis_token: ArcGISTokenResponse,
         portal: PortalContext,
-    ) {
+    ) -> Result<(), String> {
         let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
         let arcgis_token_json =
-            serde_json::to_string(&arcgis_token).expect("Failed to serialize ArcGIS token");
+            serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
+
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         sqlx::query(
             "INSERT OR REPLACE INTO tokens \
@@ -234,9 +237,22 @@ impl ArcGISAuthStore {
         .bind(&portal.api_root)
         .bind(&portal.portal_apps)
         .bind(&portal.stories_root)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .expect("Failed to store token");
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token) \
+             VALUES (?, ?)",
+        )
+        .bind(&mcp_refresh_token)
+        .bind(&mcp_access_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub async fn get_token(&self, mcp_access_token: &str) -> Option<McpTokenRecord> {
@@ -285,18 +301,6 @@ impl ArcGISAuthStore {
 
     pub async fn validate_token(&self, mcp_access_token: &str) -> bool {
         self.get_token(mcp_access_token).await.is_some()
-    }
-
-    pub async fn store_refresh_token(&self, mcp_refresh_token: String, mcp_access_token: String) {
-        sqlx::query(
-            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token) \
-             VALUES (?, ?)",
-        )
-        .bind(&mcp_refresh_token)
-        .bind(&mcp_access_token)
-        .execute(&self.pool)
-        .await
-        .expect("Failed to store refresh token");
     }
 
     pub async fn refresh_access_token(

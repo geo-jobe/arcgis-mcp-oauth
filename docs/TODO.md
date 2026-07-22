@@ -28,7 +28,7 @@ uses constant-time comparison.
 
 ## High — should fix
 
-- [ ] **DB errors panic request handlers.** `store_token`, `store_refresh_token`
+- [x] **DB errors panic request handlers.** `store_token`, `store_refresh_token`
   (`src/arcgis_auth.rs`) and `register_client` (`src/oauth/store.rs`) call
   `.expect(...)` on sqlx queries. A DB hiccup panics mid-request; `store_token`
   runs *after* the auth code is consumed, so a failure burns the code with no

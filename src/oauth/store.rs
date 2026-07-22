@@ -70,6 +70,7 @@ pub struct RegisteredClient {
 pub enum RegisterError {
     CapacityExceeded,
     RateLimited,
+    Internal,
 }
 
 /// Carries the server's public address for discovery metadata and the DCR client registry.
@@ -109,13 +110,18 @@ impl McpOAuthStore {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM registered_clients")
             .fetch_one(&self.pool)
             .await
-            .expect("Failed to count registered clients");
+            .map_err(|e| {
+                tracing::error!("Failed to count registered clients: {e}");
+                RegisterError::Internal
+            })?;
         if count >= MAX_REGISTERED_CLIENTS {
             return Err(RegisterError::CapacityExceeded);
         }
 
-        let redirect_uris_json =
-            serde_json::to_string(&redirect_uris).expect("Failed to serialize redirect_uris");
+        let redirect_uris_json = serde_json::to_string(&redirect_uris).map_err(|e| {
+            tracing::error!("Failed to serialize redirect_uris: {e}");
+            RegisterError::Internal
+        })?;
 
         sqlx::query(
             "INSERT OR REPLACE INTO registered_clients (client_id, redirect_uris, client_name) \
@@ -126,7 +132,10 @@ impl McpOAuthStore {
         .bind(client_name.as_deref())
         .execute(&self.pool)
         .await
-        .expect("Failed to register client");
+        .map_err(|e| {
+            tracing::error!("Failed to register client: {e}");
+            RegisterError::Internal
+        })?;
 
         Ok(())
     }

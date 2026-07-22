@@ -1,13 +1,18 @@
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    Router,
+    Json, Router,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use axum::body::Body;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::catch_panic::{CatchPanicLayer, ResponseForPanic};
+use tower_http::cors::{Any as CorsAny, CorsLayer};
 
 use crate::arcgis_auth::{ArcGISAuthStore, arcgis_callback};
 use crate::config::Settings;
@@ -18,6 +23,38 @@ use crate::oauth::routes::{
 };
 use crate::oauth::store::McpOAuthStore;
 use crate::routes::health_check;
+
+#[derive(Clone)]
+struct PanicHandler;
+
+fn panic_message(err: Box<dyn Any + Send + 'static>) -> String {
+    if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        format!("{err:?}")
+    }
+}
+
+impl ResponseForPanic for PanicHandler {
+    type ResponseBody = Body;
+
+    fn response_for_panic(
+        &mut self,
+        err: Box<dyn Any + Send + 'static>,
+    ) -> Response<Self::ResponseBody> {
+        tracing::error!(message = %panic_message(err), "request handler panicked");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "server_error",
+                "error_description": "Internal server error"
+            })),
+        )
+            .into_response()
+    }
+}
 
 pub async fn run(settings: Settings, internal_api_key: String) {
     let database_url =
@@ -79,9 +116,9 @@ pub async fn run(settings: Settings, internal_api_key: String) {
     });
 
     let cors_layer = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(CorsAny)
+        .allow_methods(CorsAny)
+        .allow_headers(CorsAny);
 
     let oauth_server_router = Router::new()
         .route(
@@ -109,7 +146,8 @@ pub async fn run(settings: Settings, internal_api_key: String) {
         .merge(arcgis_auth_router)
         .merge(internal_router)
         .with_state(oauth_route_state)
-        .layer(cors_layer);
+        .layer(cors_layer)
+        .layer(CatchPanicLayer::custom(PanicHandler));
 
     let address = settings.socket_address().expect("Invalid bind address");
     tracing::info!("Auth server starting on {}", address);
