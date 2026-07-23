@@ -58,7 +58,7 @@ uses constant-time comparison.
   documented in README.
 - [ ] **ArcGIS tokens stored as plaintext JSON at rest** in SQLite. Document it;
   consider at-rest encryption; ensure `data/` is `chmod 700`.
-- [ ] **No graceful shutdown.** `tokio` `signal` feature is enabled but unused;
+- [x] **No graceful shutdown.** `tokio` `signal` feature is enabled but unused;
   `axum::serve` has no `.with_graceful_shutdown`, so `docker stop` drops in-flight
   requests.
 - [ ] **Missing governance/config files:** `CONTRIBUTING.md`, `SECURITY.md`,
