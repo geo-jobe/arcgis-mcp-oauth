@@ -129,7 +129,8 @@ pub fn get_config() -> Result<(Settings, String), ConfigError> {
     let mut settings: Settings = toml::from_str(&contents)?;
     apply_env_overrides(&mut settings)?;
 
-    let internal_api_key = std::env::var("INTERNAL_API_KEY").map_err(|_| ConfigError::MissingInternalApiKey)?;
+    let internal_api_key =
+        std::env::var("INTERNAL_API_KEY").map_err(|_| ConfigError::MissingInternalApiKey)?;
 
     Ok((settings, internal_api_key))
 }

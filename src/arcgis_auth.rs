@@ -192,8 +192,7 @@ impl ArcGISAuthStore {
         let before_sessions = {
             let mut sessions = self.pending_oauth_sessions.write().await;
             let before = sessions.len();
-            sessions
-                .retain(|_, s| !is_expired(s.created_at, PENDING_OAUTH_SESSION_TTL_SECS));
+            sessions.retain(|_, s| !is_expired(s.created_at, PENDING_OAUTH_SESSION_TTL_SECS));
             before - sessions.len()
         };
         let before_codes = {
@@ -219,8 +218,7 @@ impl ArcGISAuthStore {
         portal: PortalContext,
     ) -> Result<(), String> {
         let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
-        let arcgis_token_json =
-            serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
+        let arcgis_token_json = serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
@@ -262,14 +260,13 @@ impl ArcGISAuthStore {
         .bind(mcp_access_token)
         .execute(&self.pool)
         .await
+            && result.rows_affected() > 0
         {
-            if result.rows_affected() > 0 {
-                sqlx::query("DELETE FROM refresh_tokens WHERE mcp_access_token = ?")
-                    .bind(mcp_access_token)
-                    .execute(&self.pool)
-                    .await
-                    .ok();
-            }
+            sqlx::query("DELETE FROM refresh_tokens WHERE mcp_access_token = ?")
+                .bind(mcp_access_token)
+                .execute(&self.pool)
+                .await
+                .ok();
         }
 
         let row = sqlx::query(
@@ -297,10 +294,6 @@ impl ArcGISAuthStore {
                 stories_root: row.get("portal_stories_root"),
             },
         })
-    }
-
-    pub async fn validate_token(&self, mcp_access_token: &str) -> bool {
-        self.get_token(mcp_access_token).await.is_some()
     }
 
     pub async fn refresh_access_token(
@@ -346,9 +339,10 @@ impl ArcGISAuthStore {
             }
         };
 
-        let portal_config = self.portal_registry.get(&portal.key).ok_or_else(|| {
-            format!("Portal '{}' not found in registry", portal.key)
-        })?;
+        let portal_config = self
+            .portal_registry
+            .get(&portal.key)
+            .ok_or_else(|| format!("Portal '{}' not found in registry", portal.key))?;
 
         let token_url = format!(
             "{}/sharing/rest/oauth2/token",
@@ -375,8 +369,7 @@ impl ArcGISAuthStore {
         };
 
         let expires_in = new_arcgis_token.expires_in;
-        let new_token_json =
-            serde_json::to_string(&new_arcgis_token).map_err(|e| e.to_string())?;
+        let new_token_json = serde_json::to_string(&new_arcgis_token).map_err(|e| e.to_string())?;
         let expires_at = chrono::Utc::now().timestamp() + expires_in as i64;
 
         let new_access = format!("mcp-token-{}", Uuid::new_v4());
@@ -584,7 +577,16 @@ pub fn pkce_challenge_from_verifier(verifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_expired;
+    use super::{is_expired, pkce_challenge_from_verifier};
+
+    #[test]
+    fn pkce_challenge_from_verifier_rfc7636_appendix_b() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            pkce_challenge_from_verifier(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
 
     #[test]
     fn is_expired_false_within_ttl() {

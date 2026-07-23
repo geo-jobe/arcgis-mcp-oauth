@@ -32,7 +32,10 @@ impl std::fmt::Debug for TokenRequest {
             .field("code", &redact_if_present(&self.code))
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
-            .field("code_verifier", &self.code_verifier.as_ref().map(|_| "<redacted>"))
+            .field(
+                "code_verifier",
+                &self.code_verifier.as_ref().map(|_| "<redacted>"),
+            )
             .field("refresh_token", &redact_if_present(&self.refresh_token))
             .finish()
     }
@@ -61,6 +64,7 @@ pub struct AuthorizeQuery {
 
 /// A client registered via POST /oauth/register (RFC 7591).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RegisteredClient {
     pub redirect_uris: Vec<String>,
     pub client_name: Option<String>,

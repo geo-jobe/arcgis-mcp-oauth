@@ -46,7 +46,9 @@ fn extract_internal_key(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn extract_mcp_token(headers: &HeaderMap) -> Option<&str> {
-    headers.get("X-MCP-Access-Token").and_then(|v| v.to_str().ok())
+    headers
+        .get("X-MCP-Access-Token")
+        .and_then(|v| v.to_str().ok())
 }
 
 pub async fn internal_session(
@@ -115,5 +117,30 @@ pub async fn internal_session(
                 portal: None,
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_equal_strings() {
+        assert!(constant_time_eq("secret-key", "secret-key"));
+    }
+
+    #[test]
+    fn constant_time_eq_unequal_same_length() {
+        assert!(!constant_time_eq("secret-key", "secret-kex"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq("short", "longer-string"));
+    }
+
+    #[test]
+    fn constant_time_eq_both_empty() {
+        assert!(constant_time_eq("", ""));
     }
 }

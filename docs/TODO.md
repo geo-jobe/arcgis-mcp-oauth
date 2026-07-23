@@ -49,7 +49,7 @@ uses constant-time comparison.
   defaults now use generic placeholders; deployment-specific TOML is ignored.
   (ArcGIS client IDs are public-by-design, not a leaked secret, but can be
   org-identifying.)
-- [ ] **No tests, no CI.** Highest-leverage gap after security. At minimum: unit
+- [x] **No tests, no CI.** Highest-leverage gap after security. At minimum: unit
   tests for `pkce_challenge_from_verifier`, `constant_time_eq`, and a token
   exchange happy/refresh path; a GitHub Actions workflow (`fmt`, `clippy -D warnings`,
   `test`).

@@ -14,8 +14,7 @@ async fn main() {
         )
         .init();
 
-    let (settings, internal_api_key) =
-        config::get_config().expect("Failed to load configuration");
+    let (settings, internal_api_key) = config::get_config().expect("Failed to load configuration");
 
     startup::run(settings, internal_api_key).await;
 }

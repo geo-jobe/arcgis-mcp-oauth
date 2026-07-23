@@ -38,6 +38,7 @@ struct AuthorizeTemplate {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct AuthorizeContinueQuery {
     pub response_type: String,
     pub client_id: String,
@@ -532,4 +533,196 @@ pub async fn oauth_register(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{
+        Json, Router,
+        body::{Body, to_bytes},
+        extract::State,
+        http::{Request, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    use serde_urlencoded;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tokio::net::TcpListener;
+
+    use crate::arcgis_auth::{
+        ArcGISAuthStore, ArcGISTokenResponse, PortalContext, pkce_challenge_from_verifier,
+    };
+    use crate::config::{ArcgisPortalConfig, PortalRegistry};
+    use crate::oauth::store::{McpOAuthStore, TokenRequest};
+
+    use super::*;
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!().run(&pool).await.expect("run migrations");
+        pool
+    }
+
+    fn test_portal(portal_url: &str) -> ArcgisPortalConfig {
+        ArcgisPortalConfig {
+            key: "test-portal".into(),
+            label: "Test Portal".into(),
+            portal_url: portal_url.into(),
+            api_root: format!("{portal_url}/sharing/rest"),
+            portal_apps: format!("{portal_url}/apps"),
+            client_id: "test-arcgis-client".into(),
+            stories_root: "https://storymaps.example.com/stories".into(),
+        }
+    }
+
+    fn test_portal_context(portal_url: &str) -> PortalContext {
+        PortalContext::from(&test_portal(portal_url))
+    }
+
+    fn sample_arcgis_token() -> ArcGISTokenResponse {
+        ArcGISTokenResponse {
+            access_token: "arcgis-access-token".into(),
+            expires_in: 3600,
+            refresh_token: Some("arcgis-refresh-token".into()),
+            username: Some("testuser".into()),
+        }
+    }
+
+    async fn invoke_oauth_token(
+        state: Arc<OAuthRouteState>,
+        req: TokenRequest,
+    ) -> (StatusCode, serde_json::Value) {
+        let body = serde_urlencoded::to_string(&req).expect("encode token request");
+        let request = Request::builder()
+            .method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .expect("build request");
+
+        let response = oauth_token(State(state), request).await.into_response();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), OAUTH_TOKEN_MAX_BODY)
+            .await
+            .expect("read response body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+        (status, json)
+    }
+
+    async fn mock_arcgis_token_server() -> String {
+        async fn token_handler() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "access_token": "new-arcgis-access",
+                    "expires_in": 7200,
+                    "refresh_token": "new-arcgis-refresh",
+                    "username": "testuser",
+                })),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock arcgis server");
+        let addr = listener.local_addr().expect("mock server address");
+        let app = Router::new().route("/sharing/rest/oauth2/token", post(token_handler));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock arcgis server");
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn oauth_token_authorization_code_and_refresh_happy_path() {
+        let portal_url = mock_arcgis_token_server().await;
+        let pool = test_pool().await;
+        let portal = test_portal(&portal_url);
+        let portal_registry = PortalRegistry::from_portals(vec![portal]).expect("portal registry");
+        let arcgis_store = Arc::new(ArcGISAuthStore::new(
+            pool.clone(),
+            "http://localhost:3324".into(),
+            portal_registry,
+        ));
+        let mcp_store = Arc::new(McpOAuthStore::new(pool, "http://localhost:3324"));
+        let state = Arc::new(OAuthRouteState {
+            mcp_store,
+            arcgis_store: arcgis_store.clone(),
+        });
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = pkce_challenge_from_verifier(verifier);
+        let redirect_uri = "http://localhost/callback".to_string();
+        let client_id = "test-client".to_string();
+        let auth_code = arcgis_store
+            .store_pending_auth_code(
+                sample_arcgis_token(),
+                client_id.clone(),
+                Some(challenge),
+                redirect_uri.clone(),
+                test_portal_context(&portal_url),
+            )
+            .await
+            .expect("store pending auth code");
+
+        let (status, body) = invoke_oauth_token(
+            state.clone(),
+            TokenRequest {
+                grant_type: "authorization_code".into(),
+                code: auth_code,
+                client_id: client_id.clone(),
+                redirect_uri: redirect_uri.clone(),
+                code_verifier: Some(verifier.into()),
+                refresh_token: String::new(),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let access_token = body["access_token"]
+            .as_str()
+            .expect("access_token in response")
+            .to_string();
+        let refresh_token = body["refresh_token"]
+            .as_str()
+            .expect("refresh_token in response")
+            .to_string();
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["expires_in"], 3600);
+        assert!(arcgis_store.get_token(&access_token).await.is_some());
+
+        let (status, body) = invoke_oauth_token(
+            state,
+            TokenRequest {
+                grant_type: "refresh_token".into(),
+                code: String::new(),
+                client_id: String::new(),
+                redirect_uri: String::new(),
+                code_verifier: None,
+                refresh_token,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let new_access = body["access_token"]
+            .as_str()
+            .expect("refreshed access_token");
+        let _new_refresh = body["refresh_token"]
+            .as_str()
+            .expect("refreshed refresh_token");
+        assert_ne!(new_access, access_token);
+        assert_eq!(body["expires_in"], 7200);
+        assert!(arcgis_store.get_token(new_access).await.is_some());
+        assert!(arcgis_store.get_token(&access_token).await.is_none());
+    }
 }

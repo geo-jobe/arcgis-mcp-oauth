@@ -2,13 +2,13 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::{
     Json, Router,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use axum::body::Body;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use tower_http::catch_panic::{CatchPanicLayer, ResponseForPanic};
