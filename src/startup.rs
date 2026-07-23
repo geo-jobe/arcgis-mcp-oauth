@@ -5,7 +5,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::{
     Json, Router,
-    http::StatusCode,
+    http::{
+        Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -54,6 +57,15 @@ impl ResponseForPanic for PanicHandler {
         )
             .into_response()
     }
+}
+
+// ponytail: origins stay Any for MCP clients from arbitrary hosts; methods/headers
+// are allowlisted; no cookies/credentials (bearer tokens only).
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(CorsAny)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
 }
 
 pub async fn run(settings: Settings, internal_api_key: String) {
@@ -115,10 +127,7 @@ pub async fn run(settings: Settings, internal_api_key: String) {
         internal_api_key: Arc::new(internal_api_key),
     });
 
-    let cors_layer = CorsLayer::new()
-        .allow_origin(CorsAny)
-        .allow_methods(CorsAny)
-        .allow_headers(CorsAny);
+    let cors_layer = cors_layer();
 
     let oauth_server_router = Router::new()
         .route(

@@ -53,8 +53,9 @@ uses constant-time comparison.
   tests for `pkce_challenge_from_verifier`, `constant_time_eq`, and a token
   exchange happy/refresh path; a GitHub Actions workflow (`fmt`, `clippy -D warnings`,
   `test`).
-- [ ] **CORS `Any`** on all routes including `/oauth/token`. Acceptable for bearer
-  endpoints (no cookies), but tighten `allow_methods`/`allow_headers` and document.
+- [x] **CORS `Any`** on all routes including `/oauth/token`. Acceptable for bearer
+  endpoints (no cookies); `allow_methods`/`allow_headers` are allowlisted and
+  documented in README.
 - [ ] **ArcGIS tokens stored as plaintext JSON at rest** in SQLite. Document it;
   consider at-rest encryption; ensure `data/` is `chmod 700`.
 - [ ] **No graceful shutdown.** `tokio` `signal` feature is enabled but unused;
