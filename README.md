@@ -26,8 +26,6 @@ fn auth_middleware() {
 }
 ```
 
-The sibling [arcgis-mcp-rs](../arcgis-mcp-rs/) project is the MCP resource server — it validates tokens via this service's `/internal/session` endpoint.
-
 ## Local development
 
 ### 1. Configure environment
@@ -37,7 +35,7 @@ cp .env.example .env
 cp config/local.example.toml config/local.toml
 ```
 
-Set `INTERNAL_API_KEY` to a shared secret (must match mcp-rs).
+Set `INTERNAL_API_KEY` to a shared secret (used by your mcp).
 
 ### 2. Configure an ArcGIS portal
 
@@ -57,16 +55,10 @@ INTERNAL_API_KEY=dev-secret cargo run
 
 Listens on `http://localhost:3324` by default (`config/local.toml`).
 
-### 4. Start mcp-rs
+### 4. Connect your MCP server
 
-```bash
-cd ../arcgis-mcp-rs
-AUTH_SERVICE_URL=http://localhost:3324 \
-INTERNAL_API_KEY=dev-secret \
-cargo run
-```
-
-Listens on `http://localhost:3325`.
+Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the
+same `INTERNAL_API_KEY`. See your MCP server project for its run command.
 
 ### 5. OAuth flow
 
@@ -86,5 +78,5 @@ Listens on `http://localhost:3325`.
 | `GET /oauth/authorize/continue` | Redirect to ArcGIS |
 | `POST /oauth/token` | Token exchange |
 | `GET /arcgis/callback` | ArcGIS OAuth callback |
-| `GET /internal/session` | Session introspection (mcp-rs only) |
+| `GET /internal/session` | Session introspection |
 | `GET /health` | Health check |
