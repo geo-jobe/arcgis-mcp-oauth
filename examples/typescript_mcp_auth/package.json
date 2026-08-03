@@ -1,0 +1,23 @@
+{
+  "name": "typescript-mcp-arcgis-auth-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx --env-file-if-exists=.env server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test server.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
