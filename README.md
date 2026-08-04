@@ -30,7 +30,7 @@ Many ArcGIS MCP integrations rely on hard-coded API keys or shared service accou
 
 You point your MCP server at `arcgis-mcp-oauth`. When a user connects through their MCP client, `arcgis-mcp-oauth` handles the login: the user authenticates through a normal browser-based ArcGIS OAuth flow. From that point on, your MCP server just calls a single internal endpoint to get a live, user-scoped ArcGIS token whenever it needs one.
 
-See the [MCP authorization spec](https://modelcontextprotocol.io/docs/tutorials/security/autho) for background on this pattern.
+See the [MCP authorization spec](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/authorization#the-authorization-flow-step-by-step) for background on this pattern.
 
 Example authorization middleware:
 
