@@ -1,9 +1,11 @@
 # Ignore everything by default
 *
 
-# Allow runtime inputs
+# Allow runtime inputs (example configs only; never bake local secrets into image)
 !config/
 !config/**
+config/local.toml
+config/production.toml
 !target/release/arcgis-mcp-oauth
 !Dockerfile
 !.dockerignore

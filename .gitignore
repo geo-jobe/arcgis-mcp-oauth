@@ -1,5 +1,8 @@
 /target
 /data
 .env
+**/.env
 /config/local.toml
 /config/production.toml
+__pycache__/
+*.pyc
