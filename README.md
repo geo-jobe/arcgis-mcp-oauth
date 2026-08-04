@@ -1,4 +1,14 @@
-# arcgis-mcp-oauth
+<p align="center">
+  <a href="https://geo-jobe.com/">
+    <img src="https://github.com/geo-jobe.png" alt="GEO Jobe" width="80">
+  </a>
+</p>
+
+<h1 align="center">arcgis-mcp-oauth</h1>
+
+<p align="center">
+  Built and maintained by <a href="https://geo-jobe.com/">GEO Jobe</a>, an Esri Platinum business partner.
+</p>
 
 OAuth 2.0 authorization server for the ArcGIS MCP stack. Brokers a double-PKCE flow against ArcGIS Online/Enterprise and issues opaque `mcp-token-*` bearer tokens.
 
@@ -80,3 +90,9 @@ same `INTERNAL_API_KEY`. See your MCP server project for its run command.
 | `GET /arcgis/callback` | ArcGIS OAuth callback |
 | `GET /internal/session` | Session introspection |
 | `GET /health` | Health check |
+
+---
+
+<p align="center">
+  Made with ❤️ by <a href="https://geo-jobe.com/">GEO Jobe</a> — GIS software and services for the Esri ArcGIS System.
+</p>
