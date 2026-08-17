@@ -57,6 +57,10 @@ cp config/local.example.toml config/local.toml
 
 Set `INTERNAL_API_KEY` to a shared secret (used by your MCP server).
 
+`PUBLIC_BASE_URL` is also the OAuth authorization server's canonical issuer. Configure it to the
+externally reachable base URL without a trailing slash. The exact value is published as `issuer` in
+authorization-server metadata.
+
 ### 2. Configure an ArcGIS portal
 
 Replace the placeholder portal in `config/local.toml` with the details for your ArcGIS OAuth application. Its redirect URI must be:
@@ -100,6 +104,13 @@ Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the sa
 | `GET /arcgis/callback` | ArcGIS OAuth callback |
 | `GET /internal/session` | Session introspection |
 | `GET /health` | Health check |
+
+## Authorization response issuer
+
+Authorization success and redirect-based error responses include the RFC 9207 `iss` query
+parameter. OAuth clients must compare it exactly with the `issuer` value from
+`/.well-known/oauth-authorization-server` and reject the response if the values differ. The server
+preserves registered callback query parameters and the client's `state` while adding `iss`.
 
 ## Examples
 

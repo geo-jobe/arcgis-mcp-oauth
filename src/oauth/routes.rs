@@ -15,7 +15,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::arcgis_auth::{
-    ArcGISAuthStore, PendingStoreError, percent_encode_component, pkce_challenge_from_verifier,
+    ArcGISAuthStore, PendingStoreError, authorization_response_redirect, percent_encode_component,
+    pkce_challenge_from_verifier,
 };
 use crate::config::ArcgisPortalConfig;
 use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, RegisterError, TokenRequest};
@@ -59,15 +60,15 @@ pub struct OAuthRouteState {
 pub async fn oauth_authorization_server(state: State<Arc<OAuthRouteState>>) -> impl IntoResponse {
     let mut additional_fields = HashMap::new();
     additional_fields.insert(
-        "response_types_supported".into(),
-        Value::Array(vec![Value::String("code".into())]),
-    );
-    additional_fields.insert(
         "grant_types_supported".into(),
         Value::Array(vec![
             Value::String("authorization_code".into()),
             Value::String("refresh_token".into()),
         ]),
+    );
+    additional_fields.insert(
+        "authorization_response_iss_parameter_supported".into(),
+        Value::Bool(true),
     );
     let address = state.mcp_store.app_address.clone();
 
@@ -150,7 +151,13 @@ pub async fn oauth_authorize(
         Ok(html) => Html(html).into_response(),
         Err(e) => {
             tracing::error!("failed to render authorize template: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            authorization_error_redirect(
+                &template.redirect_uri,
+                template.state.as_deref(),
+                &state.mcp_store.app_address,
+                "server_error",
+                "failed to render authorization page",
+            )
         }
     }
 }
@@ -174,14 +181,13 @@ pub async fn oauth_authorize_continue(
                 "oauth_authorize_continue: unknown portal_key={}",
                 params.portal_key
             );
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_request",
-                    "error_description": "portal_key is not configured"
-                })),
-            )
-                .into_response();
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "invalid_request",
+                "portal_key is not configured",
+            );
         }
     };
 
@@ -189,8 +195,8 @@ pub async fn oauth_authorize_continue(
         .arcgis_store
         .create_pending_oauth_session(
             params.client_id,
-            params.state,
-            params.redirect_uri,
+            params.state.clone(),
+            params.redirect_uri.clone(),
             params.code_challenge,
             portal.clone(),
         )
@@ -199,14 +205,13 @@ pub async fn oauth_authorize_continue(
         Ok(ids) => ids,
         Err(PendingStoreError::CapacityExceeded) => {
             tracing::warn!("oauth_authorize_continue: pending session capacity exceeded");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "server_error",
-                    "error_description": "authorization session limit reached"
-                })),
-            )
-                .into_response();
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "server_error",
+                "authorization session limit reached",
+            );
         }
     };
 
@@ -225,6 +230,21 @@ pub async fn oauth_authorize_continue(
         portal.key
     );
     Redirect::to(&arcgis_auth_url).into_response()
+}
+
+fn authorization_error_redirect(
+    redirect_uri: &str,
+    state: Option<&str>,
+    issuer: &str,
+    error: &str,
+    description: &str,
+) -> axum::response::Response {
+    authorization_response_redirect(
+        redirect_uri,
+        issuer,
+        &[("error", error), ("error_description", description)],
+        state,
+    )
 }
 
 pub async fn oauth_token(
@@ -543,7 +563,7 @@ mod tests {
         Json, Router,
         body::{Body, to_bytes},
         extract::State,
-        http::{Request, StatusCode},
+        http::{Request, StatusCode, header::LOCATION},
         response::IntoResponse,
         routing::post,
     };
@@ -724,5 +744,133 @@ mod tests {
         assert_eq!(body["expires_in"], 7200);
         assert!(arcgis_store.get_token(new_access).await.is_some());
         assert!(arcgis_store.get_token(&access_token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_and_redirect_error_use_the_same_issuer() {
+        let issuer = "https://auth.example.com";
+        let pool = test_pool().await;
+        let portal_registry =
+            PortalRegistry::from_portals(vec![test_portal("https://portal.example.com")])
+                .expect("portal registry");
+        let arcgis_store = Arc::new(ArcGISAuthStore::new(
+            pool.clone(),
+            issuer.into(),
+            portal_registry,
+        ));
+        let mcp_store = Arc::new(McpOAuthStore::new(pool, issuer));
+        let redirect_uri = "https://client.example.com/callback?tenant=one";
+        mcp_store
+            .register_client("test-client".into(), vec![redirect_uri.into()], None)
+            .await
+            .expect("register client");
+        let state = Arc::new(OAuthRouteState {
+            mcp_store,
+            arcgis_store,
+        });
+
+        let metadata_response = oauth_authorization_server(State(state.clone()))
+            .await
+            .into_response();
+        let metadata_bytes = to_bytes(metadata_response.into_body(), 4096)
+            .await
+            .expect("read metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
+        assert_eq!(metadata["issuer"], issuer);
+        assert_eq!(
+            metadata["authorization_response_iss_parameter_supported"],
+            true
+        );
+
+        let response = oauth_authorize_continue(
+            Query(AuthorizeContinueQuery {
+                response_type: "code".into(),
+                client_id: "test-client".into(),
+                redirect_uri: redirect_uri.into(),
+                scope: None,
+                state: Some("state +&=".into()),
+                code_challenge: None,
+                code_challenge_method: None,
+                portal_key: "unknown-portal".into(),
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[LOCATION]
+            .to_str()
+            .expect("location header");
+        let pairs: Vec<_> = url::Url::parse(location)
+            .expect("parse redirect URL")
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+        assert!(pairs.contains(&("tenant".into(), "one".into())));
+        assert!(pairs.contains(&("error".into(), "invalid_request".into())));
+        assert!(pairs.contains(&("state".into(), "state +&=".into())));
+        assert!(pairs.contains(&("iss".into(), issuer.into())));
+    }
+
+    #[tokio::test]
+    async fn authorize_does_not_redirect_to_unvalidated_uri() {
+        let pool = test_pool().await;
+        let portal_registry =
+            PortalRegistry::from_portals(vec![test_portal("https://portal.example.com")])
+                .expect("portal registry");
+        let mcp_store = Arc::new(McpOAuthStore::new(pool.clone(), "https://auth.example.com"));
+        mcp_store
+            .register_client(
+                "test-client".into(),
+                vec!["https://client.example.com/callback".into()],
+                None,
+            )
+            .await
+            .expect("register client");
+        let state = Arc::new(OAuthRouteState {
+            mcp_store,
+            arcgis_store: Arc::new(ArcGISAuthStore::new(
+                pool,
+                "https://auth.example.com".into(),
+                portal_registry,
+            )),
+        });
+
+        let response = oauth_authorize(
+            Query(crate::oauth::store::AuthorizeQuery {
+                response_type: "code".into(),
+                client_id: "unknown-client".into(),
+                redirect_uri: "https://attacker.example.com/callback".into(),
+                scope: None,
+                state: Some("client-state".into()),
+                code_challenge: None,
+                code_challenge_method: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(LOCATION));
+
+        let response = oauth_authorize(
+            Query(crate::oauth::store::AuthorizeQuery {
+                response_type: "code".into(),
+                client_id: "test-client".into(),
+                redirect_uri: "https://attacker.example.com/callback".into(),
+                scope: None,
+                state: Some("client-state".into()),
+                code_challenge: None,
+                code_challenge_method: None,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(LOCATION));
     }
 }

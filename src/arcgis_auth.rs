@@ -446,15 +446,21 @@ impl ArcGISAuthStore {
 
 #[derive(Debug, Deserialize)]
 pub struct CallbackQuery {
-    pub code: String,
+    pub code: Option<String>,
     pub state: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
 }
 
 pub async fn arcgis_callback(
     Query(params): Query<CallbackQuery>,
     State(store): State<Arc<ArcGISAuthStore>>,
 ) -> impl IntoResponse {
-    tracing::debug!("arcgis_callback: code present={}", !params.code.is_empty());
+    tracing::debug!(
+        "arcgis_callback: code present={}, error present={}",
+        params.code.as_ref().is_some_and(|code| !code.is_empty()),
+        params.error.is_some()
+    );
 
     let state_id = match params.state {
         Some(s) if !s.is_empty() => s,
@@ -480,11 +486,32 @@ pub async fn arcgis_callback(
         }
     };
 
+    if let Some(error) = params.error.as_deref() {
+        let mut response_params = vec![("error", error)];
+        if let Some(description) = params.error_description.as_deref() {
+            response_params.push(("error_description", description));
+        }
+        return authorization_response_redirect(
+            &session.mcp_redirect_uri,
+            &store.base_url,
+            &response_params,
+            session.mcp_client_state.as_deref(),
+        );
+    }
+
+    let code = match params.code.as_deref() {
+        Some(code) if !code.is_empty() => code,
+        _ => {
+            tracing::warn!("arcgis_callback: missing code and error params");
+            return authorization_error_redirect(&session, &store.base_url, "server_error");
+        }
+    };
+
     let verifier_str = match std::str::from_utf8(&session.arcgis_pkce_verifier) {
         Ok(s) => s.to_string(),
         Err(_) => {
             tracing::warn!("arcgis_callback: pkce verifier is not valid UTF-8");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return authorization_error_redirect(&session, &store.base_url, "server_error");
         }
     };
 
@@ -497,7 +524,7 @@ pub async fn arcgis_callback(
     let arcgis_token: ArcGISTokenResponse = match exchange_oauth_authorization_code(
         &token_url,
         &session.portal.client_id,
-        &params.code,
+        code,
         &server_callback,
         &verifier_str,
     )
@@ -511,7 +538,7 @@ pub async fn arcgis_callback(
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("arcgis_callback: token exchange failed: {}", e);
-            return StatusCode::BAD_GATEWAY.into_response();
+            return authorization_error_redirect(&session, &store.base_url, "server_error");
         }
     };
 
@@ -527,8 +554,8 @@ pub async fn arcgis_callback(
     let mcp_auth_code = match store
         .store_pending_auth_code(
             arcgis_token,
-            session.client_id,
-            session.mcp_code_challenge,
+            session.client_id.clone(),
+            session.mcp_code_challenge.clone(),
             session.mcp_redirect_uri.clone(),
             portal_context,
         )
@@ -537,7 +564,7 @@ pub async fn arcgis_callback(
         Ok(code) => code,
         Err(PendingStoreError::CapacityExceeded) => {
             tracing::warn!("arcgis_callback: pending auth code capacity exceeded");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return authorization_error_redirect(&session, &store.base_url, "server_error");
         }
     };
 
@@ -547,11 +574,75 @@ pub async fn arcgis_callback(
         session.portal.key
     );
 
-    let mut redirect_url = format!("{}?code={}", session.mcp_redirect_uri, mcp_auth_code);
-    if let Some(state) = session.mcp_client_state {
-        redirect_url.push_str(&format!("&state={}", percent_encode_component(&state)));
+    authorization_response_redirect(
+        &session.mcp_redirect_uri,
+        &store.base_url,
+        &[("code", &mcp_auth_code)],
+        session.mcp_client_state.as_deref(),
+    )
+}
+
+fn authorization_error_redirect(
+    session: &PendingOAuthSession,
+    issuer: &str,
+    error: &str,
+) -> axum::response::Response {
+    authorization_response_redirect(
+        &session.mcp_redirect_uri,
+        issuer,
+        &[("error", error)],
+        session.mcp_client_state.as_deref(),
+    )
+}
+
+pub fn authorization_response_redirect(
+    redirect_uri: &str,
+    issuer: &str,
+    response_params: &[(&str, &str)],
+    state: Option<&str>,
+) -> axum::response::Response {
+    match authorization_response_url(redirect_uri, issuer, response_params, state) {
+        Ok(url) => Redirect::to(url.as_str()).into_response(),
+        Err(error) => {
+            tracing::error!("validated OAuth redirect URI is not a valid URL: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-    Redirect::to(&redirect_url).into_response()
+}
+
+fn authorization_response_url(
+    redirect_uri: &str,
+    issuer: &str,
+    response_params: &[(&str, &str)],
+    state: Option<&str>,
+) -> Result<url::Url, url::ParseError> {
+    const RESPONSE_PARAMETER_NAMES: &[&str] = &[
+        "code",
+        "error",
+        "error_description",
+        "error_uri",
+        "state",
+        "iss",
+    ];
+
+    let mut url = url::Url::parse(redirect_uri)?;
+    let existing_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| !RESPONSE_PARAMETER_NAMES.contains(&name.as_ref()))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear().extend_pairs(existing_pairs);
+        pairs.extend_pairs(response_params.iter().copied());
+        if let Some(state) = state {
+            pairs.append_pair("state", state);
+        }
+        pairs.append_pair("iss", issuer);
+    }
+
+    Ok(url)
 }
 
 fn generate_pkce_verifier() -> Vec<u8> {
@@ -577,7 +668,86 @@ pub fn pkce_challenge_from_verifier(verifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_expired, pkce_challenge_from_verifier};
+    use std::sync::Arc;
+
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        http::{StatusCode, header::LOCATION},
+        response::IntoResponse,
+        routing::post,
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tokio::net::TcpListener;
+
+    use crate::config::{ArcgisPortalConfig, PortalRegistry};
+
+    use super::{
+        ArcGISAuthStore, CallbackQuery, arcgis_callback, authorization_response_url, is_expired,
+        pkce_challenge_from_verifier,
+    };
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!().run(&pool).await.expect("run migrations");
+        pool
+    }
+
+    fn test_portal(portal_url: &str) -> ArcgisPortalConfig {
+        ArcgisPortalConfig {
+            key: "test-portal".into(),
+            label: "Test Portal".into(),
+            portal_url: portal_url.into(),
+            api_root: format!("{portal_url}/sharing/rest"),
+            portal_apps: format!("{portal_url}/apps"),
+            client_id: "test-arcgis-client".into(),
+            stories_root: "https://storymaps.example.com/stories".into(),
+        }
+    }
+
+    async fn test_store(portal_url: &str, issuer: &str) -> Arc<ArcGISAuthStore> {
+        let registry =
+            PortalRegistry::from_portals(vec![test_portal(portal_url)]).expect("portal registry");
+        Arc::new(ArcGISAuthStore::new(
+            test_pool().await,
+            issuer.into(),
+            registry,
+        ))
+    }
+
+    async fn mock_arcgis_token_server() -> String {
+        async fn token_handler() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "access_token": "arcgis-access-token",
+                    "expires_in": 3600,
+                    "refresh_token": "arcgis-refresh-token",
+                    "username": "testuser",
+                })),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock ArcGIS server");
+        let address = listener.local_addr().expect("mock server address");
+        let app = Router::new().route("/sharing/rest/oauth2/token", post(token_handler));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock ArcGIS server");
+        });
+        format!("http://{address}")
+    }
 
     #[test]
     fn pkce_challenge_from_verifier_rfc7636_appendix_b() {
@@ -598,5 +768,126 @@ mod tests {
     fn is_expired_true_past_ttl() {
         let created_at = chrono::Utc::now().timestamp() - 601;
         assert!(is_expired(created_at, 600));
+    }
+
+    #[test]
+    fn authorization_response_url_preserves_query_and_encodes_response() {
+        let issuer = "https://auth.example.com/tenant name";
+        let url = authorization_response_url(
+            "https://client.example.com/callback?tenant=a%2Fb&iss=old&state=old#complete",
+            issuer,
+            &[("code", "code +&=")],
+            Some("state +&="),
+        )
+        .expect("build authorization response URL");
+        let pairs: Vec<_> = url.query_pairs().collect();
+
+        assert_eq!(url.fragment(), Some("complete"));
+        assert!(pairs.contains(&("tenant".into(), "a/b".into())));
+        assert!(pairs.contains(&("code".into(), "code +&=".into())));
+        assert!(pairs.contains(&("state".into(), "state +&=".into())));
+        assert!(pairs.contains(&("iss".into(), issuer.into())));
+        assert_eq!(pairs.iter().filter(|(name, _)| name == "iss").count(), 1);
+        assert_eq!(pairs.iter().filter(|(name, _)| name == "state").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn callback_success_includes_state_and_issuer() {
+        let issuer = "https://auth.example.com";
+        let portal_url = mock_arcgis_token_server().await;
+        let store = test_store(&portal_url, issuer).await;
+        let redirect_uri = "https://client.example.com/callback?tenant=one";
+        let (state_id, _) = store
+            .create_pending_oauth_session(
+                "client-id".into(),
+                Some("state +&=".into()),
+                redirect_uri.into(),
+                Some("mcp-pkce-challenge".into()),
+                test_portal(&portal_url),
+            )
+            .await
+            .expect("create pending OAuth session");
+
+        let response = arcgis_callback(
+            Query(CallbackQuery {
+                code: Some("arcgis-code".into()),
+                state: Some(state_id),
+                error: None,
+                error_description: None,
+            }),
+            State(store),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[LOCATION]
+            .to_str()
+            .expect("location header");
+        let url = url::Url::parse(location).expect("parse redirect URL");
+        let pairs: Vec<_> = url.query_pairs().collect();
+        assert!(pairs.contains(&("tenant".into(), "one".into())));
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| { name == "code" && value.starts_with("mcp-code-") })
+        );
+        assert!(pairs.contains(&("state".into(), "state +&=".into())));
+        assert!(pairs.contains(&("iss".into(), issuer.into())));
+    }
+
+    #[tokio::test]
+    async fn callback_error_redirects_only_after_valid_state() {
+        let issuer = "https://auth.example.com";
+        let portal_url = "https://portal.example.com";
+        let store = test_store(portal_url, issuer).await;
+        let (state_id, _) = store
+            .create_pending_oauth_session(
+                "client-id".into(),
+                Some("client-state".into()),
+                "https://client.example.com/callback".into(),
+                None,
+                test_portal(portal_url),
+            )
+            .await
+            .expect("create pending OAuth session");
+
+        let response = arcgis_callback(
+            Query(CallbackQuery {
+                code: None,
+                state: Some(state_id),
+                error: Some("access_denied".into()),
+                error_description: Some("User denied access".into()),
+            }),
+            State(store.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[LOCATION]
+            .to_str()
+            .expect("location header");
+        let pairs: Vec<_> = url::Url::parse(location)
+            .expect("parse redirect URL")
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+        assert!(pairs.contains(&("error".into(), "access_denied".into())));
+        assert!(pairs.contains(&("state".into(), "client-state".into())));
+        assert!(pairs.contains(&("iss".into(), issuer.into())));
+
+        let response = arcgis_callback(
+            Query(CallbackQuery {
+                code: None,
+                state: Some("unknown-state".into()),
+                error: Some("access_denied".into()),
+                error_description: None,
+            }),
+            State(store),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(LOCATION));
     }
 }
