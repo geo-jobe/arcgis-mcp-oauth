@@ -1,0 +1,2 @@
+ALTER TABLE tokens ADD COLUMN resource_uri TEXT NOT NULL DEFAULT '';
+ALTER TABLE refresh_tokens ADD COLUMN resource_uri TEXT NOT NULL DEFAULT '';

@@ -61,6 +61,7 @@ pub struct McpTokenRecord {
     pub arcgis_token: ArcGISTokenResponse,
     pub portal: PortalContext,
     pub expires_at: i64,
+    pub resource: String,
 }
 
 /// Stored when /oauth/authorize/continue is received; consumed by /arcgis/callback.
@@ -70,6 +71,7 @@ pub struct PendingOAuthSession {
     pub mcp_client_state: Option<String>,
     pub mcp_redirect_uri: String,
     pub mcp_code_challenge: Option<String>,
+    pub resource: String,
     pub arcgis_pkce_verifier: Vec<u8>,
     pub portal: ArcgisPortalConfig,
     pub created_at: i64,
@@ -82,6 +84,7 @@ pub struct PendingAuthCode {
     pub client_id: String,
     pub mcp_code_challenge: Option<String>,
     pub mcp_redirect_uri: String,
+    pub resource: String,
     pub portal: PortalContext,
     pub created_at: i64,
 }
@@ -116,6 +119,7 @@ impl ArcGISAuthStore {
         mcp_client_state: Option<String>,
         mcp_redirect_uri: String,
         mcp_code_challenge: Option<String>,
+        resource: String,
         portal: ArcgisPortalConfig,
     ) -> Result<(String, String), PendingStoreError> {
         let arcgis_pkce_verifier = generate_pkce_verifier();
@@ -133,6 +137,7 @@ impl ArcGISAuthStore {
                 mcp_client_state,
                 mcp_redirect_uri,
                 mcp_code_challenge,
+                resource,
                 arcgis_pkce_verifier,
                 portal,
                 created_at,
@@ -158,6 +163,7 @@ impl ArcGISAuthStore {
         client_id: String,
         mcp_code_challenge: Option<String>,
         mcp_redirect_uri: String,
+        resource: String,
         portal: PortalContext,
     ) -> Result<String, PendingStoreError> {
         let code = format!("mcp-code-{}", Uuid::new_v4());
@@ -173,6 +179,7 @@ impl ArcGISAuthStore {
                 client_id,
                 mcp_code_challenge,
                 mcp_redirect_uri,
+                resource,
                 portal,
                 created_at,
             },
@@ -216,6 +223,7 @@ impl ArcGISAuthStore {
         mcp_refresh_token: String,
         arcgis_token: ArcGISTokenResponse,
         portal: PortalContext,
+        resource: String,
     ) -> Result<(), String> {
         let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
         let arcgis_token_json = serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
@@ -224,8 +232,8 @@ impl ArcGISAuthStore {
 
         sqlx::query(
             "INSERT OR REPLACE INTO tokens \
-             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&mcp_access_token)
         .bind(&arcgis_token_json)
@@ -235,16 +243,18 @@ impl ArcGISAuthStore {
         .bind(&portal.api_root)
         .bind(&portal.portal_apps)
         .bind(&portal.stories_root)
+        .bind(&resource)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token) \
-             VALUES (?, ?)",
+            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri) \
+             VALUES (?, ?, ?)",
         )
         .bind(&mcp_refresh_token)
         .bind(&mcp_access_token)
+        .bind(&resource)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -253,7 +263,11 @@ impl ArcGISAuthStore {
         Ok(())
     }
 
-    pub async fn get_token(&self, mcp_access_token: &str) -> Option<McpTokenRecord> {
+    pub async fn get_token(
+        &self,
+        mcp_access_token: &str,
+        resource: &str,
+    ) -> Option<McpTokenRecord> {
         if let Ok(result) = sqlx::query(
             "DELETE FROM tokens WHERE mcp_access_token = ? AND expires_at <= unixepoch()",
         )
@@ -271,9 +285,10 @@ impl ArcGISAuthStore {
 
         let row = sqlx::query(
             "SELECT arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
-             FROM tokens WHERE mcp_access_token = ?",
+             FROM tokens WHERE mcp_access_token = ? AND resource_uri = ?",
         )
         .bind(mcp_access_token)
+        .bind(resource)
         .fetch_optional(&self.pool)
         .await
         .ok()
@@ -286,6 +301,7 @@ impl ArcGISAuthStore {
         Some(McpTokenRecord {
             arcgis_token,
             expires_at,
+            resource: resource.to_string(),
             portal: PortalContext {
                 key: row.get("portal_key"),
                 portal_url: row.get("portal_url"),
@@ -299,22 +315,29 @@ impl ArcGISAuthStore {
     pub async fn refresh_access_token(
         &self,
         mcp_refresh_token: &str,
+        resource: &str,
     ) -> Result<(String, String, u64), String> {
-        let old_access_token: Option<String> = sqlx::query_scalar(
-            "SELECT mcp_access_token FROM refresh_tokens WHERE mcp_refresh_token = ?",
+        let refresh_row = sqlx::query(
+            "SELECT mcp_access_token, resource_uri FROM refresh_tokens WHERE mcp_refresh_token = ?",
         )
         .bind(mcp_refresh_token)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        let old_access_token = old_access_token.ok_or("Invalid refresh token")?;
+        let refresh_row = refresh_row.ok_or("Invalid refresh token")?;
+        let old_access_token: String = refresh_row.get("mcp_access_token");
+        let bound_resource: String = refresh_row.get("resource_uri");
+        if bound_resource != resource {
+            return Err("resource does not match refresh token".into());
+        }
 
         let row = sqlx::query(
             "SELECT arcgis_token, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
-             FROM tokens WHERE mcp_access_token = ?",
+             FROM tokens WHERE mcp_access_token = ? AND resource_uri = ?",
         )
         .bind(&old_access_token)
+        .bind(resource)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -391,8 +414,8 @@ impl ArcGISAuthStore {
 
         sqlx::query(
             "INSERT INTO tokens \
-             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri) \
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_access)
         .bind(&new_token_json)
@@ -402,15 +425,17 @@ impl ArcGISAuthStore {
         .bind(&portal.api_root)
         .bind(&portal.portal_apps)
         .bind(&portal.stories_root)
+        .bind(resource)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token) VALUES (?, ?)",
+            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri) VALUES (?, ?, ?)",
         )
         .bind(&new_refresh)
         .bind(&new_access)
+        .bind(resource)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -557,6 +582,7 @@ pub async fn arcgis_callback(
             session.client_id.clone(),
             session.mcp_code_challenge.clone(),
             session.mcp_redirect_uri.clone(),
+            session.resource.clone(),
             portal_context,
         )
         .await
@@ -803,6 +829,7 @@ mod tests {
                 Some("state +&=".into()),
                 redirect_uri.into(),
                 Some("mcp-pkce-challenge".into()),
+                "https://mcp.example.com/mcp".into(),
                 test_portal(&portal_url),
             )
             .await
@@ -847,6 +874,7 @@ mod tests {
                 Some("client-state".into()),
                 "https://client.example.com/callback".into(),
                 None,
+                "https://mcp.example.com/mcp".into(),
                 test_portal(portal_url),
             )
             .await

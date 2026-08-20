@@ -23,6 +23,8 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
     #[serde(default)]
     pub refresh_token: String,
+    #[serde(default)]
+    pub resource: String,
 }
 
 impl std::fmt::Debug for TokenRequest {
@@ -37,6 +39,7 @@ impl std::fmt::Debug for TokenRequest {
                 &self.code_verifier.as_ref().map(|_| "<redacted>"),
             )
             .field("refresh_token", &redact_if_present(&self.refresh_token))
+            .field("resource", &self.resource)
             .finish()
     }
 }
@@ -60,6 +63,51 @@ pub struct AuthorizeQuery {
     pub state: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
+    #[serde(default)]
+    pub resource: String,
+}
+
+pub fn canonical_resource_uri(resource: &str) -> Result<String, &'static str> {
+    let mut url = url::Url::parse(resource).map_err(|_| "resource must be an absolute URI")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("resource must be an absolute HTTP or HTTPS URI");
+    }
+    if url.fragment().is_some() {
+        return Err("resource must not contain a fragment");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("resource must not contain user information");
+    }
+    url.set_fragment(None);
+    Ok(url.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_resource_uri;
+
+    #[test]
+    fn canonicalizes_resource_uri() {
+        assert_eq!(
+            canonical_resource_uri("HTTPS://MCP.Example.COM:443/mcp").unwrap(),
+            "https://mcp.example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_resource_uris() {
+        for resource in [
+            "",
+            "/mcp",
+            "ftp://example.com/mcp",
+            "https://example.com/mcp#part",
+        ] {
+            assert!(
+                canonical_resource_uri(resource).is_err(),
+                "accepted {resource}"
+            );
+        }
+    }
 }
 
 /// A client registered via POST /oauth/register (RFC 7591).

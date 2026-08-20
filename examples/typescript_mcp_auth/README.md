@@ -7,7 +7,7 @@ It demonstrates:
 
 1. The TypeScript MCP SDK's Streamable HTTP transport at `POST /mcp`.
 2. Validating the client bearer token through `arcgis-mcp-oauth`.
-3. Protected-resource metadata at `/.well-known/oauth-protected-resource`.
+3. Protected-resource metadata at `/.well-known/oauth-protected-resource/mcp`.
 4. Using the resolved ArcGIS token in a `current_arcgis_user` tool without
    returning or logging it.
 
@@ -41,6 +41,7 @@ The server resolves it with `arcgis-mcp-oauth`:
 GET /internal/session
 Authorization: Bearer <INTERNAL_API_KEY>
 X-MCP-Access-Token: mcp-token-...
+X-MCP-Resource: http://localhost:3325/mcp
 ```
 
 `INTERNAL_API_KEY` belongs only to the resource server and
@@ -50,8 +51,12 @@ client makes a request. The `current_arcgis_user` tool uses it to call
 `/community/self` and returns only public profile information.
 
 Unauthenticated requests receive a `401` with a `WWW-Authenticate` header
-pointing to `/.well-known/oauth-protected-resource`, which identifies
+pointing to `/.well-known/oauth-protected-resource/mcp`, which identifies
 `arcgis-mcp-oauth` as the authorization server.
+
+The authorization and token requests must use `http://localhost:3325/mcp` as their
+`resource`. The example sends the same value during session resolution and rejects a
+response whose `resource` does not match exactly.
 
 ## Check
 

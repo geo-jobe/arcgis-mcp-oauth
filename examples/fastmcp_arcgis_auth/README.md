@@ -9,7 +9,7 @@ It demonstrates:
 2. Starlette middleware that validates the client bearer token with
    `arcgis-mcp-oauth`.
 3. Protected-resource metadata at
-   `/.well-known/oauth-protected-resource`.
+   `/.well-known/oauth-protected-resource/mcp`.
 4. Reading the resolved ArcGIS access token and portal context in a FastMCP
    tool, then using that token against the ArcGIS REST API.
 
@@ -46,6 +46,7 @@ The server then calls `arcgis-mcp-oauth`:
 GET /internal/session
 Authorization: Bearer <INTERNAL_API_KEY>
 X-MCP-Access-Token: mcp-token-...
+X-MCP-Resource: http://localhost:3325/mcp
 ```
 
 `INTERNAL_API_KEY` belongs only to the resource server and `arcgis-mcp-oauth`; it
@@ -59,11 +60,15 @@ An unauthenticated `/mcp` request receives a `401` with a
 `WWW-Authenticate` header pointing to:
 
 ```text
-http://localhost:3325/.well-known/oauth-protected-resource
+http://localhost:3325/.well-known/oauth-protected-resource/mcp
 ```
 
 That metadata identifies `arcgis-mcp-oauth` as the authorization server, allowing an
 MCP client to begin the OAuth flow.
+
+The authorization and token requests must use `http://localhost:3325/mcp` as their
+`resource`. The example sends the same value during session resolution and rejects a
+response whose `resource` does not match exactly.
 
 ## Check
 

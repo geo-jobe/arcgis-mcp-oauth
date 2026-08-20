@@ -105,6 +105,25 @@ Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the sa
 | `GET /internal/session` | Session introspection |
 | `GET /health` | Health check |
 
+## Resource audiences
+
+OAuth requests use RFC 8707 resource indicators. The authorization request and
+authorization-code token request must both include the same absolute resource URI, for example
+`resource=http%3A%2F%2Flocalhost%3A3325%2Fmcp`. Refresh requests must include that resource again.
+The server canonicalizes HTTP(S) URIs, rejects malformed targets with `invalid_target`, and binds
+the canonical value to authorization codes, access tokens, and refresh tokens. Existing tokens
+created before resource binding require reauthorization.
+
+Resource servers must identify their audience when resolving a session and verify the returned
+`resource` exactly:
+
+```http
+GET /internal/session
+Authorization: Bearer <INTERNAL_API_KEY>
+X-MCP-Access-Token: mcp-token-...
+X-MCP-Resource: http://localhost:3325/mcp
+```
+
 ## Authorization response issuer
 
 Authorization success and redirect-based error responses include the RFC 9207 `iss` query
@@ -116,8 +135,8 @@ preserves registered callback query parameters and the client's `state` while ad
 
 The [`examples/`](./examples) directory contains sample MCP servers wired up to `arcgis-mcp-oauth`:
 
-- [`fastmcp_arcgis_auth`](./examples/fastmcp_arcgis_auth) — Python (FastMCP)
-- [`typescript_mcp_auth`](./examples/typescript_mcp_auth) — TypeScript
+- [`fastmcp_arcgis_auth`](./examples/fastmcp_arcgis_auth) - Python (FastMCP)
+- [`typescript_mcp_auth`](./examples/typescript_mcp_auth) - TypeScript
 
 ## License
 

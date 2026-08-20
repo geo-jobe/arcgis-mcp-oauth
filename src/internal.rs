@@ -26,6 +26,8 @@ struct SessionResponse {
     arcgis_token: Option<ArcGISTokenResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     portal: Option<PortalContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -51,6 +53,10 @@ fn extract_mcp_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
+fn extract_resource(headers: &HeaderMap) -> Option<&str> {
+    headers.get("X-MCP-Resource").and_then(|v| v.to_str().ok())
+}
+
 pub async fn internal_session(
     State(state): State<Arc<InternalRouteState>>,
     headers: HeaderMap,
@@ -65,6 +71,7 @@ pub async fn internal_session(
                     expires_at: None,
                     arcgis_token: None,
                     portal: None,
+                    resource: None,
                 }),
             );
         }
@@ -78,6 +85,7 @@ pub async fn internal_session(
                 expires_at: None,
                 arcgis_token: None,
                 portal: None,
+                resource: None,
             }),
         );
     }
@@ -92,13 +100,32 @@ pub async fn internal_session(
                     expires_at: None,
                     arcgis_token: None,
                     portal: None,
+                    resource: None,
+                }),
+            );
+        }
+    };
+
+    let resource = match extract_resource(&headers)
+        .and_then(|value| crate::oauth::store::canonical_resource_uri(value).ok())
+    {
+        Some(resource) => resource,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SessionResponse {
+                    active: false,
+                    expires_at: None,
+                    arcgis_token: None,
+                    portal: None,
+                    resource: None,
                 }),
             );
         }
     };
 
     let store: &ArcGISAuthStore = &state.oauth.arcgis_store;
-    match store.get_token(mcp_token).await {
+    match store.get_token(mcp_token, &resource).await {
         Some(record) => (
             StatusCode::OK,
             Json(SessionResponse {
@@ -106,6 +133,7 @@ pub async fn internal_session(
                 expires_at: Some(record.expires_at),
                 arcgis_token: Some(record.arcgis_token),
                 portal: Some(record.portal),
+                resource: Some(record.resource),
             }),
         ),
         None => (
@@ -115,6 +143,7 @@ pub async fn internal_session(
                 expires_at: None,
                 arcgis_token: None,
                 portal: None,
+                resource: None,
             }),
         ),
     }

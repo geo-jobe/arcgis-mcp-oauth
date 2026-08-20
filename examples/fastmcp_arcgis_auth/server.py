@@ -59,19 +59,29 @@ def extract_bearer(headers: dict[str, str] | Any) -> str | None:
 class MicroAuthClient:
     """Resolves an MCP bearer token into ArcGIS credentials."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self._session_url = f"{settings.auth_service_url}/internal/session"
         self._internal_api_key = settings.internal_api_key
+        self._resource_uri = f"{settings.public_base_url}/mcp"
+        self._transport = transport
 
     async def resolve_session(self, mcp_access_token: str) -> ArcGISSession | None:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(
+                timeout=5.0,
+                transport=self._transport,
+            ) as client:
                 response = await client.get(
                     self._session_url,
                     headers={
                         # This is the resource server's credential, not the user token.
                         "Authorization": f"Bearer {self._internal_api_key}",
                         "X-MCP-Access-Token": mcp_access_token,
+                        "X-MCP-Resource": self._resource_uri,
                     },
                 )
                 response.raise_for_status()
@@ -81,7 +91,12 @@ class MicroAuthClient:
 
         arcgis_token = payload.get("arcgis_token")
         portal = payload.get("portal")
-        if not payload.get("active") or not isinstance(arcgis_token, dict) or not isinstance(portal, dict):
+        if (
+            not payload.get("active")
+            or payload.get("resource") != self._resource_uri
+            or not isinstance(arcgis_token, dict)
+            or not isinstance(portal, dict)
+        ):
             return None
 
         access_token = arcgis_token.get("access_token")
@@ -179,17 +194,19 @@ def build_app(settings: Settings) -> Starlette:
             "portal_url": session.portal_url,
         }
 
+    resource_uri = f"{settings.public_base_url}/mcp"
+
     async def protected_resource_metadata(_: Request) -> JSONResponse:
         return JSONResponse(
             {
-                "resource": f"{settings.public_base_url}/mcp",
+                "resource": resource_uri,
                 "authorization_servers": [settings.auth_service_url],
                 "bearer_methods_supported": ["header"],
                 "scopes_supported": ["profile", "email"],
             }
         )
 
-    metadata_url = f"{settings.public_base_url}/.well-known/oauth-protected-resource"
+    metadata_url = f"{settings.public_base_url}/.well-known/oauth-protected-resource/mcp"
     mcp_app = mcp.http_app(
         path="/mcp",
         transport="streamable-http",
@@ -206,6 +223,10 @@ def build_app(settings: Settings) -> Starlette:
         routes=[
             Route(
                 "/.well-known/oauth-protected-resource",
+                protected_resource_metadata,
+            ),
+            Route(
+                "/.well-known/oauth-protected-resource/mcp",
                 protected_resource_metadata,
             ),
             Mount("/", app=mcp_app),

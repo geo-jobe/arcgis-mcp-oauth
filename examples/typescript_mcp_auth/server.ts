@@ -25,6 +25,7 @@ interface McpConnection {
 
 interface SessionResponse {
   active?: boolean;
+  resource?: unknown;
   arcgis_token?: { access_token?: unknown; username?: unknown };
   portal?: { portal_url?: unknown; api_root?: unknown };
 }
@@ -47,10 +48,15 @@ export function extractBearer(authorization: string | undefined): string | undef
   return scheme?.toLowerCase() === "bearer" && token ? token : undefined;
 }
 
-async function resolveSession(
+export function resourceUri(settings: Settings): string {
+  return `${settings.publicBaseUrl}/mcp`;
+}
+
+export async function resolveSession(
   settings: Settings,
   mcpAccessToken: string,
 ): Promise<ArcGISSession | undefined> {
+  const resource = resourceUri(settings);
   let response: globalThis.Response;
   try {
     response = await fetch(`${settings.authServiceUrl}/internal/session`, {
@@ -58,6 +64,7 @@ async function resolveSession(
         // This is the resource server's credential, not the user's MCP token.
         Authorization: `Bearer ${settings.internalApiKey}`,
         "X-MCP-Access-Token": mcpAccessToken,
+        "X-MCP-Resource": resource,
       },
       signal: AbortSignal.timeout(5_000),
     });
@@ -81,6 +88,7 @@ async function resolveSession(
   const apiRoot = payload.portal?.api_root;
   if (
     !payload.active ||
+    payload.resource !== resource ||
     typeof accessToken !== "string" ||
     typeof portalUrl !== "string" ||
     typeof apiRoot !== "string"
@@ -159,17 +167,20 @@ function mcpError(response: Response, status: number, message: string): void {
 
 export function buildApp(settings: Settings) {
   const app = express();
-  const metadataUrl = `${settings.publicBaseUrl}/.well-known/oauth-protected-resource`;
+  const resource = resourceUri(settings);
+  const metadataUrl = `${settings.publicBaseUrl}/.well-known/oauth-protected-resource/mcp`;
   const connections = new Map<string, McpConnection>();
 
-  app.get("/.well-known/oauth-protected-resource", (_request, response) => {
+  const protectedResourceMetadata = (_request: Request, response: Response) => {
     response.json({
-      resource: `${settings.publicBaseUrl}/mcp`,
+      resource,
       authorization_servers: [settings.authServiceUrl],
       bearer_methods_supported: ["header"],
       scopes_supported: ["profile", "email"],
     });
-  });
+  };
+  app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+  app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
 
   async function authenticate(request: Request, response: Response): Promise<ArcGISSession | undefined> {
     const mcpAccessToken = extractBearer(request.header("authorization"));

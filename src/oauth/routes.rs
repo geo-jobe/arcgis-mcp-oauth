@@ -19,6 +19,7 @@ use crate::arcgis_auth::{
     pkce_challenge_from_verifier,
 };
 use crate::config::ArcgisPortalConfig;
+use crate::oauth::store::canonical_resource_uri;
 use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, RegisterError, TokenRequest};
 
 /// Max bytes for `/oauth/token` form body (grant_type, code, PKCE, redirect_uri, etc.).
@@ -31,6 +32,7 @@ struct AuthorizeTemplate {
     response_type: String,
     client_id: String,
     redirect_uri: String,
+    resource: String,
     scope: Option<String>,
     state: Option<String>,
     code_challenge: Option<String>,
@@ -44,6 +46,7 @@ pub struct AuthorizeContinueQuery {
     pub response_type: String,
     pub client_id: String,
     pub redirect_uri: String,
+    pub resource: String,
     pub scope: Option<String>,
     pub state: Option<String>,
     pub code_challenge: Option<String>,
@@ -134,12 +137,26 @@ pub async fn oauth_authorize(
         return (status, Json(body)).into_response();
     }
 
+    let resource = match canonical_resource_uri(&params.resource) {
+        Ok(resource) => resource,
+        Err(description) => {
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "invalid_target",
+                description,
+            );
+        }
+    };
+
     let continue_url = format!("{}/oauth/authorize/continue", state.mcp_store.app_address);
     let template = AuthorizeTemplate {
         continue_url,
         response_type: params.response_type,
         client_id: params.client_id,
         redirect_uri: params.redirect_uri,
+        resource,
         scope: params.scope,
         state: params.state,
         code_challenge: params.code_challenge,
@@ -174,6 +191,19 @@ pub async fn oauth_authorize_continue(
         return (status, Json(body)).into_response();
     }
 
+    let resource = match canonical_resource_uri(&params.resource) {
+        Ok(resource) => resource,
+        Err(description) => {
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "invalid_target",
+                description,
+            );
+        }
+    };
+
     let portal = match state.arcgis_store.portal_registry().get(&params.portal_key) {
         Some(portal) => portal.clone(),
         None => {
@@ -198,6 +228,7 @@ pub async fn oauth_authorize_continue(
             params.state.clone(),
             params.redirect_uri.clone(),
             params.code_challenge,
+            resource,
             portal.clone(),
         )
         .await
@@ -284,6 +315,20 @@ pub async fn oauth_token(
         }
     };
 
+    let resource = match canonical_resource_uri(&token_req.resource) {
+        Ok(resource) => resource,
+        Err(description) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_target",
+                    "error_description": description
+                })),
+            )
+                .into_response();
+        }
+    };
+
     if token_req.grant_type == "refresh_token" {
         tracing::info!("Processing refresh_token grant");
 
@@ -300,7 +345,7 @@ pub async fn oauth_token(
 
         match state
             .arcgis_store
-            .refresh_access_token(&token_req.refresh_token)
+            .refresh_access_token(&token_req.refresh_token, &resource)
             .await
         {
             Ok((new_access, new_refresh, expires_in)) => {
@@ -318,10 +363,15 @@ pub async fn oauth_token(
             }
             Err(e) => {
                 tracing::error!("Failed to refresh token: {}", e);
+                let error = if e == "resource does not match refresh token" {
+                    "invalid_target"
+                } else {
+                    "invalid_grant"
+                };
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
-                        "error": "invalid_grant",
+                        "error": error,
                         "error_description": e
                     })),
                 )
@@ -370,6 +420,17 @@ pub async fn oauth_token(
                 .into_response();
         }
     };
+
+    if resource != pending.resource {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_target",
+                "error_description": "resource does not match the authorization request"
+            })),
+        )
+            .into_response();
+    }
 
     if token_req.client_id != pending.client_id {
         tracing::warn!(
@@ -464,6 +525,7 @@ pub async fn oauth_token(
             mcp_refresh_token.clone(),
             pending.arcgis_token,
             pending.portal,
+            pending.resource,
         )
         .await
     {
@@ -684,13 +746,42 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let challenge = pkce_challenge_from_verifier(verifier);
         let redirect_uri = "http://localhost/callback".to_string();
+        let resource = "http://localhost:3325/mcp".to_string();
         let client_id = "test-client".to_string();
+        let mismatched_code = arcgis_store
+            .store_pending_auth_code(
+                sample_arcgis_token(),
+                client_id.clone(),
+                Some(challenge.clone()),
+                redirect_uri.clone(),
+                resource.clone(),
+                test_portal_context(&portal_url),
+            )
+            .await
+            .expect("store mismatched pending auth code");
+        let (status, body) = invoke_oauth_token(
+            state.clone(),
+            TokenRequest {
+                grant_type: "authorization_code".into(),
+                code: mismatched_code,
+                client_id: client_id.clone(),
+                redirect_uri: redirect_uri.clone(),
+                code_verifier: Some(verifier.into()),
+                refresh_token: String::new(),
+                resource: "http://localhost:9999/mcp".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_target");
+
         let auth_code = arcgis_store
             .store_pending_auth_code(
                 sample_arcgis_token(),
                 client_id.clone(),
                 Some(challenge),
                 redirect_uri.clone(),
+                resource.clone(),
                 test_portal_context(&portal_url),
             )
             .await
@@ -705,6 +796,7 @@ mod tests {
                 redirect_uri: redirect_uri.clone(),
                 code_verifier: Some(verifier.into()),
                 refresh_token: String::new(),
+                resource: resource.clone(),
             },
         )
         .await;
@@ -719,7 +811,40 @@ mod tests {
             .to_string();
         assert_eq!(body["token_type"], "Bearer");
         assert_eq!(body["expires_in"], 3600);
-        assert!(arcgis_store.get_token(&access_token).await.is_some());
+        assert!(
+            arcgis_store
+                .get_token(&access_token, &resource)
+                .await
+                .is_some()
+        );
+        assert!(
+            arcgis_store
+                .get_token(&access_token, "http://localhost:9999/mcp")
+                .await
+                .is_none()
+        );
+
+        let (status, body) = invoke_oauth_token(
+            state.clone(),
+            TokenRequest {
+                grant_type: "refresh_token".into(),
+                code: String::new(),
+                client_id: String::new(),
+                redirect_uri: String::new(),
+                code_verifier: None,
+                refresh_token: refresh_token.clone(),
+                resource: "http://localhost:9999/mcp".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_target");
+        assert!(
+            arcgis_store
+                .get_token(&access_token, &resource)
+                .await
+                .is_some()
+        );
 
         let (status, body) = invoke_oauth_token(
             state,
@@ -730,6 +855,7 @@ mod tests {
                 redirect_uri: String::new(),
                 code_verifier: None,
                 refresh_token,
+                resource: resource.clone(),
             },
         )
         .await;
@@ -742,8 +868,18 @@ mod tests {
             .expect("refreshed refresh_token");
         assert_ne!(new_access, access_token);
         assert_eq!(body["expires_in"], 7200);
-        assert!(arcgis_store.get_token(new_access).await.is_some());
-        assert!(arcgis_store.get_token(&access_token).await.is_none());
+        assert!(
+            arcgis_store
+                .get_token(new_access, &resource)
+                .await
+                .is_some()
+        );
+        assert!(
+            arcgis_store
+                .get_token(&access_token, &resource)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -788,13 +924,14 @@ mod tests {
                 response_type: "code".into(),
                 client_id: "test-client".into(),
                 redirect_uri: redirect_uri.into(),
+                resource: "https://mcp.example.com/mcp".into(),
                 scope: None,
                 state: Some("state +&=".into()),
                 code_challenge: None,
                 code_challenge_method: None,
                 portal_key: "unknown-portal".into(),
             }),
-            State(state),
+            State(state.clone()),
         )
         .await
         .into_response();
@@ -842,6 +979,7 @@ mod tests {
                 response_type: "code".into(),
                 client_id: "unknown-client".into(),
                 redirect_uri: "https://attacker.example.com/callback".into(),
+                resource: "https://mcp.example.com/mcp".into(),
                 scope: None,
                 state: Some("client-state".into()),
                 code_challenge: None,
@@ -860,6 +998,26 @@ mod tests {
                 response_type: "code".into(),
                 client_id: "test-client".into(),
                 redirect_uri: "https://attacker.example.com/callback".into(),
+                resource: "https://mcp.example.com/mcp".into(),
+                scope: None,
+                state: Some("client-state".into()),
+                code_challenge: None,
+                code_challenge_method: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(LOCATION));
+
+        let response = oauth_authorize(
+            Query(crate::oauth::store::AuthorizeQuery {
+                response_type: "code".into(),
+                client_id: "test-client".into(),
+                redirect_uri: "https://client.example.com/callback".into(),
+                resource: String::new(),
                 scope: None,
                 state: Some("client-state".into()),
                 code_challenge: None,
@@ -870,7 +1028,8 @@ mod tests {
         .await
         .into_response();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!response.headers().contains_key(LOCATION));
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[LOCATION].to_str().expect("location");
+        assert!(location.contains("error=invalid_target"));
     }
 }
