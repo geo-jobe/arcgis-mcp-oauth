@@ -28,6 +28,8 @@ struct SessionResponse {
     portal: Option<PortalContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scopes: Option<Vec<String>>,
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -72,6 +74,7 @@ pub async fn internal_session(
                     arcgis_token: None,
                     portal: None,
                     resource: None,
+                    scopes: None,
                 }),
             );
         }
@@ -86,6 +89,7 @@ pub async fn internal_session(
                 arcgis_token: None,
                 portal: None,
                 resource: None,
+                scopes: None,
             }),
         );
     }
@@ -101,6 +105,7 @@ pub async fn internal_session(
                     arcgis_token: None,
                     portal: None,
                     resource: None,
+                    scopes: None,
                 }),
             );
         }
@@ -119,6 +124,7 @@ pub async fn internal_session(
                     arcgis_token: None,
                     portal: None,
                     resource: None,
+                    scopes: None,
                 }),
             );
         }
@@ -134,6 +140,7 @@ pub async fn internal_session(
                 arcgis_token: Some(record.arcgis_token),
                 portal: Some(record.portal),
                 resource: Some(record.resource),
+                scopes: Some(record.scopes),
             }),
         ),
         None => (
@@ -144,6 +151,7 @@ pub async fn internal_session(
                 arcgis_token: None,
                 portal: None,
                 resource: None,
+                scopes: None,
             }),
         ),
     }
@@ -151,7 +159,7 @@ pub async fn internal_session(
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{SessionResponse, constant_time_eq};
 
     #[test]
     fn constant_time_eq_equal_strings() {
@@ -171,5 +179,21 @@ mod tests {
     #[test]
     fn constant_time_eq_both_empty() {
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn session_response_exposes_granted_scopes() {
+        let value = serde_json::to_value(SessionResponse {
+            active: true,
+            expires_at: None,
+            arcgis_token: None,
+            portal: None,
+            resource: Some("https://mcp.example.com/mcp".into()),
+            scopes: Some(vec!["profile".into()]),
+        })
+        .expect("serialize session response");
+
+        assert_eq!(value["scopes"], serde_json::json!(["profile"]));
+        assert!(value.get("arcgis_token").is_none());
     }
 }

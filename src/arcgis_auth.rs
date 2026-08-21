@@ -62,6 +62,7 @@ pub struct McpTokenRecord {
     pub portal: PortalContext,
     pub expires_at: i64,
     pub resource: String,
+    pub scopes: Vec<String>,
 }
 
 /// Stored when /oauth/authorize/continue is received; consumed by /arcgis/callback.
@@ -72,6 +73,7 @@ pub struct PendingOAuthSession {
     pub mcp_redirect_uri: String,
     pub mcp_code_challenge: Option<String>,
     pub resource: String,
+    pub scopes: Vec<String>,
     pub arcgis_pkce_verifier: Vec<u8>,
     pub portal: ArcgisPortalConfig,
     pub created_at: i64,
@@ -85,6 +87,7 @@ pub struct PendingAuthCode {
     pub mcp_code_challenge: Option<String>,
     pub mcp_redirect_uri: String,
     pub resource: String,
+    pub scopes: Vec<String>,
     pub portal: PortalContext,
     pub created_at: i64,
 }
@@ -120,6 +123,7 @@ impl ArcGISAuthStore {
         mcp_redirect_uri: String,
         mcp_code_challenge: Option<String>,
         resource: String,
+        scopes: Vec<String>,
         portal: ArcgisPortalConfig,
     ) -> Result<(String, String), PendingStoreError> {
         let arcgis_pkce_verifier = generate_pkce_verifier();
@@ -138,6 +142,7 @@ impl ArcGISAuthStore {
                 mcp_redirect_uri,
                 mcp_code_challenge,
                 resource,
+                scopes,
                 arcgis_pkce_verifier,
                 portal,
                 created_at,
@@ -164,6 +169,7 @@ impl ArcGISAuthStore {
         mcp_code_challenge: Option<String>,
         mcp_redirect_uri: String,
         resource: String,
+        scopes: Vec<String>,
         portal: PortalContext,
     ) -> Result<String, PendingStoreError> {
         let code = format!("mcp-code-{}", Uuid::new_v4());
@@ -180,6 +186,7 @@ impl ArcGISAuthStore {
                 mcp_code_challenge,
                 mcp_redirect_uri,
                 resource,
+                scopes,
                 portal,
                 created_at,
             },
@@ -224,6 +231,7 @@ impl ArcGISAuthStore {
         arcgis_token: ArcGISTokenResponse,
         portal: PortalContext,
         resource: String,
+        scopes: Vec<String>,
     ) -> Result<(), String> {
         let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
         let arcgis_token_json = serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
@@ -232,8 +240,8 @@ impl ArcGISAuthStore {
 
         sqlx::query(
             "INSERT OR REPLACE INTO tokens \
-             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri, scope) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&mcp_access_token)
         .bind(&arcgis_token_json)
@@ -244,17 +252,19 @@ impl ArcGISAuthStore {
         .bind(&portal.portal_apps)
         .bind(&portal.stories_root)
         .bind(&resource)
+        .bind(crate::oauth::store::scope_string(&scopes))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri) \
-             VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri, scope) \
+             VALUES (?, ?, ?, ?)",
         )
         .bind(&mcp_refresh_token)
         .bind(&mcp_access_token)
         .bind(&resource)
+        .bind(crate::oauth::store::scope_string(&scopes))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -284,7 +294,7 @@ impl ArcGISAuthStore {
         }
 
         let row = sqlx::query(
-            "SELECT arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
+            "SELECT arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, scope \
              FROM tokens WHERE mcp_access_token = ? AND resource_uri = ?",
         )
         .bind(mcp_access_token)
@@ -297,11 +307,14 @@ impl ArcGISAuthStore {
         let arcgis_token_json: String = row.get("arcgis_token");
         let arcgis_token: ArcGISTokenResponse = serde_json::from_str(&arcgis_token_json).ok()?;
         let expires_at: i64 = row.get("expires_at");
+        let scope: String = row.get("scope");
+        let scopes = crate::oauth::store::normalize_scope(&scope).ok()?;
 
         Some(McpTokenRecord {
             arcgis_token,
             expires_at,
             resource: resource.to_string(),
+            scopes,
             portal: PortalContext {
                 key: row.get("portal_key"),
                 portal_url: row.get("portal_url"),
@@ -316,9 +329,10 @@ impl ArcGISAuthStore {
         &self,
         mcp_refresh_token: &str,
         resource: &str,
-    ) -> Result<(String, String, u64), String> {
+        requested_scopes: Option<&[String]>,
+    ) -> Result<(String, String, u64, Vec<String>), String> {
         let refresh_row = sqlx::query(
-            "SELECT mcp_access_token, resource_uri FROM refresh_tokens WHERE mcp_refresh_token = ?",
+            "SELECT mcp_access_token, resource_uri, scope FROM refresh_tokens WHERE mcp_refresh_token = ?",
         )
         .bind(mcp_refresh_token)
         .fetch_optional(&self.pool)
@@ -331,9 +345,19 @@ impl ArcGISAuthStore {
         if bound_resource != resource {
             return Err("resource does not match refresh token".into());
         }
+        let refresh_scope: String = refresh_row.get("scope");
+        let granted_scopes = crate::oauth::store::normalize_scope(&refresh_scope)
+            .map_err(|_| "Invalid scope stored for refresh token")?;
+        let scopes = match requested_scopes {
+            Some(requested) if requested.iter().all(|scope| granted_scopes.contains(scope)) => {
+                requested.to_vec()
+            }
+            Some(_) => return Err("requested scope exceeds original grant".into()),
+            None => granted_scopes.clone(),
+        };
 
         let row = sqlx::query(
-            "SELECT arcgis_token, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root \
+            "SELECT arcgis_token, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, scope \
              FROM tokens WHERE mcp_access_token = ? AND resource_uri = ?",
         )
         .bind(&old_access_token)
@@ -343,6 +367,13 @@ impl ArcGISAuthStore {
         .map_err(|e| e.to_string())?;
 
         let row = row.ok_or("Access token not found for refresh")?;
+        let access_scope: String = row.get("scope");
+        if crate::oauth::store::normalize_scope(&access_scope)
+            .map_err(|_| "Invalid scope stored for access token")?
+            != granted_scopes
+        {
+            return Err("access and refresh token scopes do not match".into());
+        }
         let arcgis_token_json: String = row.get("arcgis_token");
         let arcgis_token: ArcGISTokenResponse =
             serde_json::from_str(&arcgis_token_json).map_err(|e| e.to_string())?;
@@ -414,8 +445,8 @@ impl ArcGISAuthStore {
 
         sqlx::query(
             "INSERT INTO tokens \
-              (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri) \
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri, scope) \
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_access)
         .bind(&new_token_json)
@@ -426,23 +457,25 @@ impl ArcGISAuthStore {
         .bind(&portal.portal_apps)
         .bind(&portal.stories_root)
         .bind(resource)
+        .bind(crate::oauth::store::scope_string(&scopes))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri) VALUES (?, ?, ?)",
+            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri, scope) VALUES (?, ?, ?, ?)",
         )
         .bind(&new_refresh)
         .bind(&new_access)
         .bind(resource)
+        .bind(crate::oauth::store::scope_string(&scopes))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         tx.commit().await.map_err(|e| e.to_string())?;
 
-        Ok((new_access, new_refresh, expires_in))
+        Ok((new_access, new_refresh, expires_in, scopes))
     }
 
     async fn cleanup_session(
@@ -583,6 +616,7 @@ pub async fn arcgis_callback(
             session.mcp_code_challenge.clone(),
             session.mcp_redirect_uri.clone(),
             session.resource.clone(),
+            session.scopes.clone(),
             portal_context,
         )
         .await
@@ -830,6 +864,7 @@ mod tests {
                 redirect_uri.into(),
                 Some("mcp-pkce-challenge".into()),
                 "https://mcp.example.com/mcp".into(),
+                vec!["profile".into()],
                 test_portal(&portal_url),
             )
             .await
@@ -875,6 +910,7 @@ mod tests {
                 "https://client.example.com/callback".into(),
                 None,
                 "https://mcp.example.com/mcp".into(),
+                vec!["profile".into()],
                 test_portal(portal_url),
             )
             .await

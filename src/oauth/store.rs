@@ -25,6 +25,8 @@ pub struct TokenRequest {
     pub refresh_token: String,
     #[serde(default)]
     pub resource: String,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl std::fmt::Debug for TokenRequest {
@@ -40,6 +42,7 @@ impl std::fmt::Debug for TokenRequest {
             )
             .field("refresh_token", &redact_if_present(&self.refresh_token))
             .field("resource", &self.resource)
+            .field("scope", &self.scope)
             .finish()
     }
 }
@@ -67,6 +70,47 @@ pub struct AuthorizeQuery {
     pub resource: String,
 }
 
+pub const SUPPORTED_SCOPES: &[&str] = &["profile"];
+
+pub fn normalize_authorization_scope(scope: Option<&str>) -> Result<Vec<String>, &'static str> {
+    match scope {
+        Some(scope) => normalize_scope(scope),
+        None => Ok(SUPPORTED_SCOPES
+            .iter()
+            .map(|scope| (*scope).into())
+            .collect()),
+    }
+}
+
+pub fn normalize_scope(scope: &str) -> Result<Vec<String>, &'static str> {
+    if scope.is_empty() {
+        return Err("scope must not be empty");
+    }
+
+    let mut scopes = Vec::new();
+    for value in scope.split_ascii_whitespace() {
+        if !value.bytes().all(|byte| {
+            byte == 0x21 || (0x23..=0x5b).contains(&byte) || (0x5d..=0x7e).contains(&byte)
+        }) {
+            return Err("scope contains invalid characters");
+        }
+        if !SUPPORTED_SCOPES.contains(&value) {
+            return Err("requested scope is not supported");
+        }
+        scopes.push(value.to_string());
+    }
+    if scopes.is_empty() {
+        return Err("scope must not be empty");
+    }
+    scopes.sort_unstable();
+    scopes.dedup();
+    Ok(scopes)
+}
+
+pub fn scope_string(scopes: &[String]) -> String {
+    scopes.join(" ")
+}
+
 pub fn canonical_resource_uri(resource: &str) -> Result<String, &'static str> {
     let mut url = url::Url::parse(resource).map_err(|_| "resource must be an absolute URI")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -84,7 +128,7 @@ pub fn canonical_resource_uri(resource: &str) -> Result<String, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_resource_uri;
+    use super::{canonical_resource_uri, normalize_authorization_scope, normalize_scope};
 
     #[test]
     fn canonicalizes_resource_uri() {
@@ -107,6 +151,19 @@ mod tests {
                 "accepted {resource}"
             );
         }
+    }
+
+    #[test]
+    fn normalizes_and_defaults_scopes() {
+        assert_eq!(normalize_scope("profile  profile").unwrap(), ["profile"]);
+        assert_eq!(normalize_authorization_scope(None).unwrap(), ["profile"]);
+    }
+
+    #[test]
+    fn rejects_empty_unknown_and_invalid_scopes() {
+        assert!(normalize_scope("").is_err());
+        assert!(normalize_scope("email").is_err());
+        assert!(normalize_scope("profile\u{00a0}").is_err());
     }
 }
 

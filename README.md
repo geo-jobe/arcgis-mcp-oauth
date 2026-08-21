@@ -124,6 +124,22 @@ X-MCP-Access-Token: mcp-token-...
 X-MCP-Resource: http://localhost:3325/mcp
 ```
 
+## OAuth scopes
+
+Scopes issued by this service authorize MCP operations; they are not ArcGIS OAuth scopes and are
+not sent to an ArcGIS portal. ArcGIS continues to constrain the upstream token through the signed-in
+user's privileges and content access. The resource server must separately enforce the MCP scopes
+returned by `/internal/session` before using that ArcGIS token.
+
+The examples currently implement the `profile` scope. An omitted scope on an authorization request
+defaults to `profile`; unsupported scopes are rejected with `invalid_scope` before ArcGIS login.
+Token responses contain the normalized space-delimited `scope`, while `/internal/session` returns
+the same grant as a `scopes` array. A refresh request without `scope` preserves its grant. A refresh
+request may request a subset of the original grant but can never expand it.
+
+Tokens issued before scope persistence was introduced are invalidated by the database migration and
+must be reauthorized.
+
 ## Authorization response issuer
 
 Authorization success and redirect-based error responses include the RFC 9207 `iss` query

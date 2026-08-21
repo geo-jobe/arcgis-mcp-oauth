@@ -48,6 +48,7 @@ class ArcGISSession:
     portal_url: str
     api_root: str
     username: str | None
+    scopes: frozenset[str]
 
 
 def extract_bearer(headers: dict[str, str] | Any) -> str | None:
@@ -91,11 +92,14 @@ class MicroAuthClient:
 
         arcgis_token = payload.get("arcgis_token")
         portal = payload.get("portal")
+        scopes = payload.get("scopes")
         if (
             not payload.get("active")
             or payload.get("resource") != self._resource_uri
             or not isinstance(arcgis_token, dict)
             or not isinstance(portal, dict)
+            or not isinstance(scopes, list)
+            or not all(isinstance(scope, str) for scope in scopes)
         ):
             return None
 
@@ -111,7 +115,22 @@ class MicroAuthClient:
             portal_url=portal_url,
             api_root=api_root,
             username=username if isinstance(username, str) else None,
+            scopes=frozenset(scopes),
         )
+
+
+def has_required_scopes(session: ArcGISSession, required_scopes: frozenset[str]) -> bool:
+    return required_scopes.issubset(session.scopes)
+
+
+def insufficient_scope_challenge(
+    resource_metadata_url: str, required_scopes: frozenset[str]
+) -> str:
+    required = " ".join(sorted(required_scopes))
+    return (
+        f'Bearer error="insufficient_scope", scope="{required}", '
+        f'resource_metadata="{resource_metadata_url}"'
+    )
 
 
 class MCPBearerAuthMiddleware(BaseHTTPMiddleware):
@@ -122,10 +141,12 @@ class MCPBearerAuthMiddleware(BaseHTTPMiddleware):
         app: Any,
         auth_client: MicroAuthClient,
         resource_metadata_url: str,
+        required_scopes: frozenset[str],
     ) -> None:
         super().__init__(app)
         self._auth_client = auth_client
         self._resource_metadata_url = resource_metadata_url
+        self._required_scopes = required_scopes
 
     def unauthorized(self, error: str | None = None) -> JSONResponse:
         challenge = f'Bearer resource_metadata="{self._resource_metadata_url}"'
@@ -137,6 +158,17 @@ class MCPBearerAuthMiddleware(BaseHTTPMiddleware):
             headers={"WWW-Authenticate": challenge},
         )
 
+    def insufficient_scope(self) -> JSONResponse:
+        required = " ".join(sorted(self._required_scopes))
+        challenge = insufficient_scope_challenge(
+            self._resource_metadata_url, self._required_scopes
+        )
+        return JSONResponse(
+            {"detail": f"Required scope: {required}"},
+            status_code=403,
+            headers={"WWW-Authenticate": challenge},
+        )
+
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         mcp_access_token = extract_bearer(request.headers)
         if not mcp_access_token:
@@ -145,6 +177,8 @@ class MCPBearerAuthMiddleware(BaseHTTPMiddleware):
         session = await self._auth_client.resolve_session(mcp_access_token)
         if not session:
             return self.unauthorized("invalid_token")
+        if not has_required_scopes(session, self._required_scopes):
+            return self.insufficient_scope()
 
         # Cache only for this HTTP request. Do not put bearer tokens in logs.
         request.state.arcgis_session = session
@@ -202,7 +236,7 @@ def build_app(settings: Settings) -> Starlette:
                 "resource": resource_uri,
                 "authorization_servers": [settings.auth_service_url],
                 "bearer_methods_supported": ["header"],
-                "scopes_supported": ["profile", "email"],
+                "scopes_supported": ["profile"],
             }
         )
 
@@ -215,6 +249,7 @@ def build_app(settings: Settings) -> Starlette:
                 MCPBearerAuthMiddleware,
                 auth_client=auth_client,
                 resource_metadata_url=metadata_url,
+                required_scopes=frozenset({"profile"}),
             )
         ],
     )

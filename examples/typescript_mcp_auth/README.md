@@ -58,6 +58,10 @@ The authorization and token requests must use `http://localhost:3325/mcp` as the
 `resource`. The example sends the same value during session resolution and rejects a
 response whose `resource` does not match exactly.
 
+The `current_arcgis_user` tool requires the broker-local `profile` scope. This scope is enforced by
+the MCP server and is not forwarded to ArcGIS. A valid token without the scope receives a `403`
+`insufficient_scope` challenge.
+
 ## Check
 
 ```bash

@@ -2,7 +2,14 @@ import unittest
 
 import httpx
 
-from server import MicroAuthClient, Settings, extract_bearer
+from server import (
+    ArcGISSession,
+    MicroAuthClient,
+    Settings,
+    extract_bearer,
+    has_required_scopes,
+    insufficient_scope_challenge,
+)
 
 
 class ExtractBearerTests(unittest.TestCase):
@@ -49,6 +56,29 @@ class ResolveSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await client.resolve_session("mcp-token"))
         self.assertEqual(requested_resource, "https://mcp.example.com/mcp")
+
+
+class ScopeTests(unittest.TestCase):
+    def test_requires_every_scope(self) -> None:
+        session = ArcGISSession(
+            access_token="arcgis-token",
+            portal_url="https://portal.example.com",
+            api_root="https://portal.example.com/sharing/rest",
+            username=None,
+            scopes=frozenset({"profile"}),
+        )
+        self.assertTrue(has_required_scopes(session, frozenset({"profile"})))
+        self.assertFalse(has_required_scopes(session, frozenset({"profile", "email"})))
+
+    def test_insufficient_scope_challenge_identifies_the_missing_grant(self) -> None:
+        self.assertEqual(
+            insufficient_scope_challenge(
+                "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+                frozenset({"profile"}),
+            ),
+            'Bearer error="insufficient_scope", scope="profile", '
+            'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"',
+        )
 
 
 if __name__ == "__main__":

@@ -19,8 +19,11 @@ use crate::arcgis_auth::{
     pkce_challenge_from_verifier,
 };
 use crate::config::ArcgisPortalConfig;
-use crate::oauth::store::canonical_resource_uri;
 use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, RegisterError, TokenRequest};
+use crate::oauth::store::{
+    SUPPORTED_SCOPES, canonical_resource_uri, normalize_authorization_scope, normalize_scope,
+    scope_string,
+};
 
 /// Max bytes for `/oauth/token` form body (grant_type, code, PKCE, redirect_uri, etc.).
 const OAUTH_TOKEN_MAX_BODY: usize = 4096;
@@ -78,7 +81,12 @@ pub async fn oauth_authorization_server(state: State<Arc<OAuthRouteState>>) -> i
     let metadata = AuthorizationMetadata {
         authorization_endpoint: format!("{}/oauth/authorize", address),
         token_endpoint: format!("{}/oauth/token", address),
-        scopes_supported: Some(vec!["profile".to_string(), "email".to_string()]),
+        scopes_supported: Some(
+            SUPPORTED_SCOPES
+                .iter()
+                .map(|scope| (*scope).into())
+                .collect(),
+        ),
         registration_endpoint: Some(format!("{}/oauth/register", address)),
         response_types_supported: Some(vec!["code".to_string()]),
         issuer: Some(address.to_string()),
@@ -149,6 +157,18 @@ pub async fn oauth_authorize(
             );
         }
     };
+    let scopes = match normalize_authorization_scope(params.scope.as_deref()) {
+        Ok(scopes) => scopes,
+        Err(description) => {
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "invalid_scope",
+                description,
+            );
+        }
+    };
 
     let continue_url = format!("{}/oauth/authorize/continue", state.mcp_store.app_address);
     let template = AuthorizeTemplate {
@@ -157,7 +177,7 @@ pub async fn oauth_authorize(
         client_id: params.client_id,
         redirect_uri: params.redirect_uri,
         resource,
-        scope: params.scope,
+        scope: Some(scope_string(&scopes)),
         state: params.state,
         code_challenge: params.code_challenge,
         code_challenge_method: params.code_challenge_method,
@@ -203,6 +223,18 @@ pub async fn oauth_authorize_continue(
             );
         }
     };
+    let scopes = match normalize_authorization_scope(params.scope.as_deref()) {
+        Ok(scopes) => scopes,
+        Err(description) => {
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "invalid_scope",
+                description,
+            );
+        }
+    };
 
     let portal = match state.arcgis_store.portal_registry().get(&params.portal_key) {
         Some(portal) => portal.clone(),
@@ -229,6 +261,7 @@ pub async fn oauth_authorize_continue(
             params.redirect_uri.clone(),
             params.code_challenge,
             resource,
+            scopes,
             portal.clone(),
         )
         .await
@@ -343,12 +376,30 @@ pub async fn oauth_token(
                 .into_response();
         }
 
+        let requested_scopes = match token_req.scope.as_deref().map(normalize_scope).transpose() {
+            Ok(scopes) => scopes,
+            Err(description) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_scope",
+                        "error_description": description
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
         match state
             .arcgis_store
-            .refresh_access_token(&token_req.refresh_token, &resource)
+            .refresh_access_token(
+                &token_req.refresh_token,
+                &resource,
+                requested_scopes.as_deref(),
+            )
             .await
         {
-            Ok((new_access, new_refresh, expires_in)) => {
+            Ok((new_access, new_refresh, expires_in, scopes)) => {
                 tracing::info!("Successfully refreshed access token");
                 return (
                     StatusCode::OK,
@@ -357,6 +408,7 @@ pub async fn oauth_token(
                         "token_type": "Bearer",
                         "expires_in": expires_in,
                         "refresh_token": new_refresh,
+                        "scope": scope_string(&scopes),
                     })),
                 )
                     .into_response();
@@ -365,6 +417,8 @@ pub async fn oauth_token(
                 tracing::error!("Failed to refresh token: {}", e);
                 let error = if e == "resource does not match refresh token" {
                     "invalid_target"
+                } else if e == "requested scope exceeds original grant" {
+                    "invalid_scope"
                 } else {
                     "invalid_grant"
                 };
@@ -526,6 +580,7 @@ pub async fn oauth_token(
             pending.arcgis_token,
             pending.portal,
             pending.resource,
+            pending.scopes.clone(),
         )
         .await
     {
@@ -548,6 +603,7 @@ pub async fn oauth_token(
             "token_type": "Bearer",
             "expires_in": expires_in,
             "refresh_token": mcp_refresh_token,
+            "scope": scope_string(&pending.scopes),
         })),
     )
         .into_response()
@@ -755,6 +811,7 @@ mod tests {
                 Some(challenge.clone()),
                 redirect_uri.clone(),
                 resource.clone(),
+                vec!["profile".into()],
                 test_portal_context(&portal_url),
             )
             .await
@@ -769,6 +826,7 @@ mod tests {
                 code_verifier: Some(verifier.into()),
                 refresh_token: String::new(),
                 resource: "http://localhost:9999/mcp".into(),
+                scope: None,
             },
         )
         .await;
@@ -782,6 +840,7 @@ mod tests {
                 Some(challenge),
                 redirect_uri.clone(),
                 resource.clone(),
+                vec!["profile".into()],
                 test_portal_context(&portal_url),
             )
             .await
@@ -797,6 +856,7 @@ mod tests {
                 code_verifier: Some(verifier.into()),
                 refresh_token: String::new(),
                 resource: resource.clone(),
+                scope: None,
             },
         )
         .await;
@@ -811,12 +871,12 @@ mod tests {
             .to_string();
         assert_eq!(body["token_type"], "Bearer");
         assert_eq!(body["expires_in"], 3600);
-        assert!(
-            arcgis_store
-                .get_token(&access_token, &resource)
-                .await
-                .is_some()
-        );
+        assert_eq!(body["scope"], "profile");
+        let stored = arcgis_store
+            .get_token(&access_token, &resource)
+            .await
+            .expect("stored access token");
+        assert_eq!(stored.scopes, ["profile"]);
         assert!(
             arcgis_store
                 .get_token(&access_token, "http://localhost:9999/mcp")
@@ -834,11 +894,35 @@ mod tests {
                 code_verifier: None,
                 refresh_token: refresh_token.clone(),
                 resource: "http://localhost:9999/mcp".into(),
+                scope: None,
             },
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_target");
+        assert!(
+            arcgis_store
+                .get_token(&access_token, &resource)
+                .await
+                .is_some()
+        );
+
+        let (status, body) = invoke_oauth_token(
+            state.clone(),
+            TokenRequest {
+                grant_type: "refresh_token".into(),
+                code: String::new(),
+                client_id: String::new(),
+                redirect_uri: String::new(),
+                code_verifier: None,
+                refresh_token: refresh_token.clone(),
+                resource: resource.clone(),
+                scope: Some("profile email".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_scope");
         assert!(
             arcgis_store
                 .get_token(&access_token, &resource)
@@ -856,6 +940,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token,
                 resource: resource.clone(),
+                scope: None,
             },
         )
         .await;
@@ -868,6 +953,7 @@ mod tests {
             .expect("refreshed refresh_token");
         assert_ne!(new_access, access_token);
         assert_eq!(body["expires_in"], 7200);
+        assert_eq!(body["scope"], "profile");
         assert!(
             arcgis_store
                 .get_token(new_access, &resource)
@@ -992,6 +1078,26 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key(LOCATION));
+
+        let response = oauth_authorize(
+            Query(crate::oauth::store::AuthorizeQuery {
+                response_type: "code".into(),
+                client_id: "test-client".into(),
+                redirect_uri: "https://client.example.com/callback".into(),
+                resource: "https://mcp.example.com/mcp".into(),
+                scope: Some("email".into()),
+                state: Some("client-state".into()),
+                code_challenge: None,
+                code_challenge_method: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[LOCATION].to_str().expect("location");
+        assert!(location.contains("error=invalid_scope"));
 
         let response = oauth_authorize(
             Query(crate::oauth::store::AuthorizeQuery {

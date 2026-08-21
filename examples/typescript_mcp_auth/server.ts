@@ -15,6 +15,7 @@ interface ArcGISSession {
   portalUrl: string;
   apiRoot: string;
   username?: string;
+  scopes: string[];
 }
 
 interface McpConnection {
@@ -28,6 +29,7 @@ interface SessionResponse {
   resource?: unknown;
   arcgis_token?: { access_token?: unknown; username?: unknown };
   portal?: { portal_url?: unknown; api_root?: unknown };
+  scopes?: unknown;
 }
 
 export function settingsFromEnvironment(environment = process.env): Settings {
@@ -91,7 +93,9 @@ export async function resolveSession(
     payload.resource !== resource ||
     typeof accessToken !== "string" ||
     typeof portalUrl !== "string" ||
-    typeof apiRoot !== "string"
+    typeof apiRoot !== "string" ||
+    !Array.isArray(payload.scopes) ||
+    !payload.scopes.every((scope) => typeof scope === "string")
   ) {
     return undefined;
   }
@@ -101,6 +105,7 @@ export async function resolveSession(
     portalUrl,
     apiRoot,
     username: typeof payload.arcgis_token?.username === "string" ? payload.arcgis_token.username : undefined,
+    scopes: payload.scopes,
   };
 }
 
@@ -111,6 +116,19 @@ function unauthorized(response: Response, metadataUrl: string, error?: string): 
   response.status(401).set("WWW-Authenticate", challenge).json({
     detail: "A valid MCP bearer token is required.",
   });
+}
+
+export function hasRequiredScopes(session: ArcGISSession, requiredScopes: readonly string[]): boolean {
+  return requiredScopes.every((scope) => session.scopes.includes(scope));
+}
+
+export function insufficientScopeChallenge(metadataUrl: string, requiredScopes: readonly string[]): string {
+  return `Bearer error="insufficient_scope", scope="${requiredScopes.join(" ")}", resource_metadata="${metadataUrl}"`;
+}
+
+function insufficientScope(response: Response, metadataUrl: string, requiredScopes: readonly string[]): void {
+  response.status(403).set("WWW-Authenticate", insufficientScopeChallenge(metadataUrl, requiredScopes))
+    .json({ detail: `Required scope: ${requiredScopes.join(" ")}` });
 }
 
 function createMcpServer(getSession: () => ArcGISSession): McpServer {
@@ -176,13 +194,17 @@ export function buildApp(settings: Settings) {
       resource,
       authorization_servers: [settings.authServiceUrl],
       bearer_methods_supported: ["header"],
-      scopes_supported: ["profile", "email"],
+      scopes_supported: ["profile"],
     });
   };
   app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
   app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
 
-  async function authenticate(request: Request, response: Response): Promise<ArcGISSession | undefined> {
+  async function authenticate(
+    request: Request,
+    response: Response,
+    requiredScopes: readonly string[] = [],
+  ): Promise<ArcGISSession | undefined> {
     const mcpAccessToken = extractBearer(request.header("authorization"));
     if (!mcpAccessToken) {
       unauthorized(response, metadataUrl);
@@ -194,12 +216,16 @@ export function buildApp(settings: Settings) {
       unauthorized(response, metadataUrl, "invalid_token");
       return undefined;
     }
+    if (!hasRequiredScopes(session, requiredScopes)) {
+      insufficientScope(response, metadataUrl, requiredScopes);
+      return undefined;
+    }
 
     return session;
   }
 
   async function handleMcpPost(request: Request, response: Response, next: NextFunction): Promise<void> {
-    const session = await authenticate(request, response);
+    const session = await authenticate(request, response, ["profile"]);
     if (!session) {
       return;
     }
@@ -242,7 +268,7 @@ export function buildApp(settings: Settings) {
   }
 
   async function handleMcpSessionRequest(request: Request, response: Response, next: NextFunction): Promise<void> {
-    const session = await authenticate(request, response);
+    const session = await authenticate(request, response, ["profile"]);
     if (!session) {
       return;
     }

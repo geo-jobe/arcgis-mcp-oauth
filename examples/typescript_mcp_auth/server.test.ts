@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { extractBearer, resolveSession, resourceUri, settingsFromEnvironment } from "./server.js";
+import {
+  extractBearer,
+  hasRequiredScopes,
+  insufficientScopeChallenge,
+  resolveSession,
+  resourceUri,
+  settingsFromEnvironment,
+} from "./server.js";
 
 test("extractBearer accepts a case-insensitive Bearer scheme", () => {
   assert.equal(extractBearer("bEaReR mcp-token-example"), "mcp-token-example");
@@ -52,4 +59,22 @@ test("resolveSession sends and verifies the resource audience", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("hasRequiredScopes enforces every required scope", () => {
+  const session = {
+    accessToken: "arcgis-token",
+    portalUrl: "https://portal.example.com",
+    apiRoot: "https://portal.example.com/sharing/rest",
+    scopes: ["profile"],
+  };
+  assert.equal(hasRequiredScopes(session, ["profile"]), true);
+  assert.equal(hasRequiredScopes(session, ["profile", "email"]), false);
+});
+
+test("insufficientScopeChallenge identifies the missing grant", () => {
+  assert.equal(
+    insufficientScopeChallenge("https://mcp.example.com/.well-known/oauth-protected-resource/mcp", ["profile"]),
+    'Bearer error="insufficient_scope", scope="profile", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"',
+  );
 });
