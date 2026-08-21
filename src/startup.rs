@@ -149,7 +149,7 @@ pub async fn run(settings: Settings, internal_api_key: String) {
     let router = Router::new()
         .route("/health", get(health_check))
         .route("/oauth/authorize", get(oauth_authorize))
-        .route("/oauth/authorize/continue", get(oauth_authorize_continue))
+        .route("/oauth/authorize/continue", post(oauth_authorize_continue))
         .route("/oauth/register", post(oauth_register))
         .merge(oauth_server_router)
         .merge(arcgis_auth_router)

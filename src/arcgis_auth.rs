@@ -20,8 +20,10 @@ use crate::config::{ArcgisPortalConfig, PortalRegistry};
 // Fixed TTLs/caps; upgrade path is env-config or per-IP rate limiting at the proxy.
 const PENDING_OAUTH_SESSION_TTL_SECS: i64 = 600;
 const PENDING_AUTH_CODE_TTL_SECS: i64 = 600;
+const PENDING_CONSENT_TTL_SECS: i64 = 600;
 const MAX_PENDING_OAUTH_SESSIONS: usize = 1000;
 const MAX_PENDING_AUTH_CODES: usize = 1000;
+const MAX_PENDING_CONSENTS: usize = 1000;
 
 pub type ArcGISTokenResponse = arcgis_sharing_rs::models::OAuthTokenResponse;
 
@@ -92,10 +94,24 @@ pub struct PendingAuthCode {
     pub created_at: i64,
 }
 
+/// Validated authorization parameters awaiting an explicit user decision.
+#[derive(Clone, Debug)]
+pub struct PendingConsent {
+    pub client_id: String,
+    pub mcp_client_state: Option<String>,
+    pub mcp_redirect_uri: String,
+    pub mcp_code_challenge: String,
+    pub resource: String,
+    pub scopes: Vec<String>,
+    csrf_token: String,
+    created_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ArcGISAuthStore {
     pub base_url: String,
     pub portal_registry: Arc<PortalRegistry>,
+    pending_consents: Arc<RwLock<HashMap<String, PendingConsent>>>,
     pending_oauth_sessions: Arc<RwLock<HashMap<String, PendingOAuthSession>>>,
     pending_auth_codes: Arc<RwLock<HashMap<String, PendingAuthCode>>>,
     pool: SqlitePool,
@@ -106,6 +122,7 @@ impl ArcGISAuthStore {
         Self {
             base_url,
             portal_registry: Arc::new(portal_registry),
+            pending_consents: Arc::new(RwLock::new(HashMap::new())),
             pending_oauth_sessions: Arc::new(RwLock::new(HashMap::new())),
             pending_auth_codes: Arc::new(RwLock::new(HashMap::new())),
             pool,
@@ -116,6 +133,57 @@ impl ArcGISAuthStore {
         &self.portal_registry
     }
 
+    pub async fn create_pending_consent(
+        &self,
+        client_id: String,
+        mcp_client_state: Option<String>,
+        mcp_redirect_uri: String,
+        mcp_code_challenge: String,
+        resource: String,
+        scopes: Vec<String>,
+    ) -> Result<(String, String), PendingStoreError> {
+        let request_id = Uuid::new_v4().to_string();
+        let csrf_token = Uuid::new_v4().to_string();
+        let mut consents = self.pending_consents.write().await;
+        consents.retain(|_, consent| !is_expired(consent.created_at, PENDING_CONSENT_TTL_SECS));
+        if consents.len() >= MAX_PENDING_CONSENTS {
+            return Err(PendingStoreError::CapacityExceeded);
+        }
+        consents.insert(
+            request_id.clone(),
+            PendingConsent {
+                client_id,
+                mcp_client_state,
+                mcp_redirect_uri,
+                mcp_code_challenge,
+                resource,
+                scopes,
+                csrf_token: csrf_token.clone(),
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
+        Ok((request_id, csrf_token))
+    }
+
+    /// Consume only when both opaque values match, keeping authorization data server-side.
+    pub async fn consume_pending_consent(
+        &self,
+        request_id: &str,
+        csrf_token: &str,
+    ) -> Option<PendingConsent> {
+        let mut consents = self.pending_consents.write().await;
+        let consent = consents.get(request_id)?;
+        if consent.csrf_token != csrf_token {
+            return None;
+        }
+        let consent = consents.remove(request_id)?;
+        if is_expired(consent.created_at, PENDING_CONSENT_TTL_SECS) {
+            return None;
+        }
+        Some(consent)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_pending_oauth_session(
         &self,
         client_id: String,
@@ -162,6 +230,7 @@ impl ArcGISAuthStore {
         Some(session)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_pending_auth_code(
         &self,
         arcgis_token: ArcGISTokenResponse,
@@ -203,6 +272,12 @@ impl ArcGISAuthStore {
     }
 
     pub async fn sweep_expired(&self) {
+        let before_consents = {
+            let mut consents = self.pending_consents.write().await;
+            let before = consents.len();
+            consents.retain(|_, consent| !is_expired(consent.created_at, PENDING_CONSENT_TTL_SECS));
+            before - consents.len()
+        };
         let before_sessions = {
             let mut sessions = self.pending_oauth_sessions.write().await;
             let before = sessions.len();
@@ -215,8 +290,9 @@ impl ArcGISAuthStore {
             codes.retain(|_, c| !is_expired(c.created_at, PENDING_AUTH_CODE_TTL_SECS));
             before - codes.len()
         };
-        if before_sessions > 0 || before_codes > 0 {
+        if before_consents > 0 || before_sessions > 0 || before_codes > 0 {
             tracing::debug!(
+                expired_consents = before_consents,
                 expired_sessions = before_sessions,
                 expired_codes = before_codes,
                 "swept expired pending OAuth state"

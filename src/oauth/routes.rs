@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::{
-    Json,
+    Form, Json,
     body::Body,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect},
 };
 use rmcp::transport::auth::AuthorizationMetadata;
@@ -19,7 +19,9 @@ use crate::arcgis_auth::{
     pkce_challenge_from_verifier,
 };
 use crate::config::ArcgisPortalConfig;
-use crate::oauth::store::{AuthorizeQuery, McpOAuthStore, RegisterError, TokenRequest};
+use crate::oauth::store::{
+    AuthorizeQuery, McpOAuthStore, RegisterError, RegisteredClient, TokenRequest,
+};
 use crate::oauth::store::{
     SUPPORTED_SCOPES, canonical_resource_uri, normalize_authorization_scope, normalize_scope,
     scope_string,
@@ -32,29 +34,22 @@ const OAUTH_TOKEN_MAX_BODY: usize = 4096;
 #[template(path = "oauth_authorize.html")]
 struct AuthorizeTemplate {
     continue_url: String,
-    response_type: String,
+    request_id: String,
+    csrf_token: String,
     client_id: String,
-    redirect_uri: String,
+    client_name: Option<String>,
     resource: String,
-    scope: Option<String>,
-    state: Option<String>,
-    code_challenge: Option<String>,
-    code_challenge_method: Option<String>,
+    scopes: Vec<String>,
     portals: Vec<ArcgisPortalConfig>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct AuthorizeContinueQuery {
-    pub response_type: String,
-    pub client_id: String,
-    pub redirect_uri: String,
-    pub resource: String,
-    pub scope: Option<String>,
-    pub state: Option<String>,
-    pub code_challenge: Option<String>,
-    pub code_challenge_method: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct AuthorizeDecision {
+    pub request_id: String,
+    pub csrf_token: String,
     pub portal_key: String,
+    pub decision: String,
 }
 
 #[derive(Clone)]
@@ -102,7 +97,7 @@ async fn validate_registered_client(
     mcp_store: &McpOAuthStore,
     client_id: &str,
     redirect_uri: &str,
-) -> Result<(), (StatusCode, Value)> {
+) -> Result<RegisteredClient, (StatusCode, Value)> {
     let registered = match mcp_store.get_registered_client(client_id).await {
         Some(c) => c,
         None => {
@@ -130,7 +125,7 @@ async fn validate_registered_client(
         ));
     }
 
-    Ok(())
+    Ok(registered)
 }
 
 pub async fn oauth_authorize(
@@ -139,11 +134,13 @@ pub async fn oauth_authorize(
 ) -> impl IntoResponse {
     tracing::debug!("oauth_authorize, params: {:?}", params);
 
-    if let Err((status, body)) =
-        validate_registered_client(&state.mcp_store, &params.client_id, &params.redirect_uri).await
-    {
-        return (status, Json(body)).into_response();
-    }
+    let registered =
+        match validate_registered_client(&state.mcp_store, &params.client_id, &params.redirect_uri)
+            .await
+        {
+            Ok(registered) => registered,
+            Err((status, body)) => return (status, Json(body)).into_response(),
+        };
 
     let resource = match canonical_resource_uri(&params.resource) {
         Ok(resource) => resource,
@@ -166,6 +163,57 @@ pub async fn oauth_authorize(
                 &state.mcp_store.app_address,
                 "invalid_scope",
                 description,
+            );
+        }
+    };
+
+    if params.response_type != "code" {
+        return authorization_error_redirect(
+            &params.redirect_uri,
+            params.state.as_deref(),
+            &state.mcp_store.app_address,
+            "unsupported_response_type",
+            "only response_type=code is supported",
+        );
+    }
+    let code_challenge = match params.code_challenge {
+        Some(challenge)
+            if params.code_challenge_method.as_deref() == Some("S256")
+                && valid_pkce_challenge(&challenge) =>
+        {
+            challenge
+        }
+        _ => {
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "invalid_request",
+                "a valid S256 PKCE code challenge is required",
+            );
+        }
+    };
+
+    let (request_id, csrf_token) = match state
+        .arcgis_store
+        .create_pending_consent(
+            params.client_id.clone(),
+            params.state.clone(),
+            params.redirect_uri.clone(),
+            code_challenge,
+            resource.clone(),
+            scopes.clone(),
+        )
+        .await
+    {
+        Ok(values) => values,
+        Err(PendingStoreError::CapacityExceeded) => {
+            return authorization_error_redirect(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                &state.mcp_store.app_address,
+                "server_error",
+                "authorization consent limit reached",
             );
         }
     };
@@ -173,68 +221,62 @@ pub async fn oauth_authorize(
     let continue_url = format!("{}/oauth/authorize/continue", state.mcp_store.app_address);
     let template = AuthorizeTemplate {
         continue_url,
-        response_type: params.response_type,
+        request_id,
+        csrf_token,
         client_id: params.client_id,
-        redirect_uri: params.redirect_uri,
+        client_name: registered.client_name,
         resource,
-        scope: Some(scope_string(&scopes)),
-        state: params.state,
-        code_challenge: params.code_challenge,
-        code_challenge_method: params.code_challenge_method,
+        scopes,
         portals: state.arcgis_store.portal_registry().list().to_vec(),
     };
 
     match template.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => consent_page_response(html),
         Err(e) => {
             tracing::error!("failed to render authorize template: {e}");
-            authorization_error_redirect(
-                &template.redirect_uri,
-                template.state.as_deref(),
-                &state.mcp_store.app_address,
-                "server_error",
-                "failed to render authorization page",
-            )
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
 
 pub async fn oauth_authorize_continue(
-    Query(params): Query<AuthorizeContinueQuery>,
     State(state): State<Arc<OAuthRouteState>>,
+    Form(params): Form<AuthorizeDecision>,
 ) -> impl IntoResponse {
-    tracing::debug!("oauth_authorize_continue, params: {:?}", params);
-
-    if let Err((status, body)) =
-        validate_registered_client(&state.mcp_store, &params.client_id, &params.redirect_uri).await
+    let consent = match state
+        .arcgis_store
+        .consume_pending_consent(&params.request_id, &params.csrf_token)
+        .await
     {
-        return (status, Json(body)).into_response();
-    }
+        Some(consent) => consent,
+        None => {
+            tracing::warn!("oauth consent rejected: missing, expired, replayed, or invalid CSRF");
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid or expired consent request",
+            )
+                .into_response();
+        }
+    };
 
-    let resource = match canonical_resource_uri(&params.resource) {
-        Ok(resource) => resource,
-        Err(description) => {
-            return authorization_error_redirect(
-                &params.redirect_uri,
-                params.state.as_deref(),
-                &state.mcp_store.app_address,
-                "invalid_target",
-                description,
-            );
-        }
-    };
-    let scopes = match normalize_authorization_scope(params.scope.as_deref()) {
-        Ok(scopes) => scopes,
-        Err(description) => {
-            return authorization_error_redirect(
-                &params.redirect_uri,
-                params.state.as_deref(),
-                &state.mcp_store.app_address,
-                "invalid_scope",
-                description,
-            );
-        }
-    };
+    if params.decision == "deny" {
+        return authorization_error_redirect(
+            &consent.mcp_redirect_uri,
+            consent.mcp_client_state.as_deref(),
+            &state.mcp_store.app_address,
+            "access_denied",
+            "the user denied the authorization request",
+        );
+    }
+    if params.decision != "allow" {
+        return authorization_error_redirect(
+            &consent.mcp_redirect_uri,
+            consent.mcp_client_state.as_deref(),
+            &state.mcp_store.app_address,
+            "invalid_request",
+            "invalid consent decision",
+        );
+    }
 
     let portal = match state.arcgis_store.portal_registry().get(&params.portal_key) {
         Some(portal) => portal.clone(),
@@ -244,8 +286,8 @@ pub async fn oauth_authorize_continue(
                 params.portal_key
             );
             return authorization_error_redirect(
-                &params.redirect_uri,
-                params.state.as_deref(),
+                &consent.mcp_redirect_uri,
+                consent.mcp_client_state.as_deref(),
                 &state.mcp_store.app_address,
                 "invalid_request",
                 "portal_key is not configured",
@@ -256,12 +298,12 @@ pub async fn oauth_authorize_continue(
     let (arcgis_state_id, arcgis_pkce_challenge) = match state
         .arcgis_store
         .create_pending_oauth_session(
-            params.client_id,
-            params.state.clone(),
-            params.redirect_uri.clone(),
-            params.code_challenge,
-            resource,
-            scopes,
+            consent.client_id.clone(),
+            consent.mcp_client_state.clone(),
+            consent.mcp_redirect_uri.clone(),
+            Some(consent.mcp_code_challenge.clone()),
+            consent.resource.clone(),
+            consent.scopes.clone(),
             portal.clone(),
         )
         .await
@@ -270,8 +312,8 @@ pub async fn oauth_authorize_continue(
         Err(PendingStoreError::CapacityExceeded) => {
             tracing::warn!("oauth_authorize_continue: pending session capacity exceeded");
             return authorization_error_redirect(
-                &params.redirect_uri,
-                params.state.as_deref(),
+                &consent.mcp_redirect_uri,
+                consent.mcp_client_state.as_deref(),
                 &state.mcp_store.app_address,
                 "server_error",
                 "authorization session limit reached",
@@ -294,6 +336,33 @@ pub async fn oauth_authorize_continue(
         portal.key
     );
     Redirect::to(&arcgis_auth_url).into_response()
+}
+
+fn valid_pkce_challenge(challenge: &str) -> bool {
+    (43..=128).contains(&challenge.len())
+        && challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+}
+
+fn consent_page_response(html: String) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    (headers, Html(html)).into_response()
 }
 
 fn authorization_error_redirect(
@@ -688,6 +757,7 @@ mod tests {
     use serde_urlencoded;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
 
     use crate::arcgis_auth::{
         ArcGISAuthStore, ArcGISTokenResponse, PortalContext, pkce_challenge_from_verifier,
@@ -780,6 +850,31 @@ mod tests {
                 .expect("serve mock arcgis server");
         });
         format!("http://{}", addr)
+    }
+
+    fn authorize_query(
+        redirect_uri: &str,
+        state: &str,
+        challenge: &str,
+    ) -> crate::oauth::store::AuthorizeQuery {
+        crate::oauth::store::AuthorizeQuery {
+            response_type: "code".into(),
+            client_id: "test-client".into(),
+            redirect_uri: redirect_uri.into(),
+            resource: "https://mcp.example.com/mcp".into(),
+            scope: Some("profile".into()),
+            state: Some(state.into()),
+            code_challenge: Some(challenge.into()),
+            code_challenge_method: Some("S256".into()),
+        }
+    }
+
+    fn form_value(html: &str, name: &str) -> String {
+        let marker = format!("name=\"{name}\" value=\"");
+        html.split_once(&marker)
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(value, _)| value.to_string())
+            .unwrap_or_else(|| panic!("missing form value {name}"))
     }
 
     #[tokio::test]
@@ -1005,19 +1100,26 @@ mod tests {
             true
         );
 
+        let (request_id, csrf_token) = state
+            .arcgis_store
+            .create_pending_consent(
+                "test-client".into(),
+                Some("state +&=".into()),
+                redirect_uri.into(),
+                pkce_challenge_from_verifier("test-verifier"),
+                "https://mcp.example.com/mcp".into(),
+                vec!["profile".into()],
+            )
+            .await
+            .expect("create pending consent");
         let response = oauth_authorize_continue(
-            Query(AuthorizeContinueQuery {
-                response_type: "code".into(),
-                client_id: "test-client".into(),
-                redirect_uri: redirect_uri.into(),
-                resource: "https://mcp.example.com/mcp".into(),
-                scope: None,
-                state: Some("state +&=".into()),
-                code_challenge: None,
-                code_challenge_method: None,
-                portal_key: "unknown-portal".into(),
-            }),
             State(state.clone()),
+            Form(AuthorizeDecision {
+                request_id,
+                csrf_token,
+                portal_key: "unknown-portal".into(),
+                decision: "allow".into(),
+            }),
         )
         .await
         .into_response();
@@ -1034,6 +1136,206 @@ mod tests {
         assert!(pairs.contains(&("error".into(), "invalid_request".into())));
         assert!(pairs.contains(&("state".into(), "state +&=".into())));
         assert!(pairs.contains(&("iss".into(), issuer.into())));
+    }
+
+    #[tokio::test]
+    async fn consent_requires_valid_csrf_and_explicit_allow_or_deny() {
+        let issuer = "https://auth.example.com";
+        let redirect_uri = "https://client.example.com/callback?tenant=one";
+        let pool = test_pool().await;
+        let portal_registry =
+            PortalRegistry::from_portals(vec![test_portal("https://portal.example.com")])
+                .expect("portal registry");
+        let mcp_store = Arc::new(McpOAuthStore::new(pool.clone(), issuer));
+        mcp_store
+            .register_client(
+                "test-client".into(),
+                vec![redirect_uri.into()],
+                Some("Example <script>Client</script>".into()),
+            )
+            .await
+            .expect("register client");
+        let state = Arc::new(OAuthRouteState {
+            mcp_store,
+            arcgis_store: Arc::new(ArcGISAuthStore::new(pool, issuer.into(), portal_registry)),
+        });
+        let challenge = pkce_challenge_from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+
+        let page = oauth_authorize(
+            Query(authorize_query(redirect_uri, "allow-state", &challenge)),
+            State(state.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            page.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .expect("CSP")
+                .contains("form-action 'self'")
+        );
+        let html = String::from_utf8(
+            to_bytes(page.into_body(), 32_768)
+                .await
+                .expect("read consent page")
+                .to_vec(),
+        )
+        .expect("UTF-8 consent page");
+        assert!(html.contains("Example"));
+        assert!(!html.contains("<script>Client</script>"));
+        assert!(html.contains("https://mcp.example.com/mcp"));
+        assert!(html.contains("Test Portal"));
+        assert!(html.contains("value=\"allow\""));
+        assert!(html.contains("value=\"deny\""));
+        assert!(!html.contains("name=\"client_id\""));
+        assert!(!html.contains("name=\"redirect_uri\""));
+        assert!(!html.contains("name=\"resource\""));
+        assert!(!html.contains("name=\"scope\""));
+        assert!(!html.contains("name=\"state\""));
+        assert!(!html.contains("name=\"code_challenge\""));
+        let request_id = form_value(&html, "request_id");
+        let csrf_token = form_value(&html, "csrf_token");
+
+        let invalid_csrf = oauth_authorize_continue(
+            State(state.clone()),
+            Form(AuthorizeDecision {
+                request_id: request_id.clone(),
+                csrf_token: "wrong-token".into(),
+                portal_key: "test-portal".into(),
+                decision: "allow".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(invalid_csrf.status(), StatusCode::BAD_REQUEST);
+        assert!(!invalid_csrf.headers().contains_key(LOCATION));
+
+        let tampered_body = serde_urlencoded::to_string([
+            ("request_id", request_id.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("portal_key", "test-portal"),
+            ("decision", "allow"),
+            ("client_id", "attacker-client"),
+        ])
+        .expect("encode tampered consent");
+        let app = Router::new()
+            .route("/oauth/authorize/continue", post(oauth_authorize_continue))
+            .with_state(state.clone());
+        let tampered = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize/continue")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(tampered_body))
+                    .expect("build tampered request"),
+            )
+            .await
+            .expect("submit tampered request");
+        assert_eq!(tampered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!tampered.headers().contains_key(LOCATION));
+
+        let allowed = oauth_authorize_continue(
+            State(state.clone()),
+            Form(AuthorizeDecision {
+                request_id: request_id.clone(),
+                csrf_token: csrf_token.clone(),
+                portal_key: "test-portal".into(),
+                decision: "allow".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(allowed.status(), StatusCode::SEE_OTHER);
+        let location = allowed.headers()[LOCATION].to_str().expect("location");
+        let arcgis_url = url::Url::parse(location).expect("parse ArcGIS redirect");
+        assert_eq!(arcgis_url.host_str(), Some("portal.example.com"));
+        assert_eq!(
+            arcgis_url
+                .query_pairs()
+                .find(|(name, _)| name == "code_challenge_method")
+                .map(|(_, value)| value.into_owned()),
+            Some("S256".into())
+        );
+        let arcgis_state = arcgis_url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("ArcGIS state");
+        let pending = state
+            .arcgis_store
+            .consume_pending_oauth_session(&arcgis_state)
+            .await
+            .expect("bound ArcGIS session");
+        assert_eq!(pending.client_id, "test-client");
+        assert_eq!(pending.mcp_client_state.as_deref(), Some("allow-state"));
+        assert_eq!(pending.mcp_redirect_uri, redirect_uri);
+        assert_eq!(
+            pending.mcp_code_challenge.as_deref(),
+            Some(challenge.as_str())
+        );
+        assert_eq!(pending.resource, "https://mcp.example.com/mcp");
+        assert_eq!(pending.scopes, ["profile"]);
+        assert_eq!(pending.portal.key, "test-portal");
+
+        let replay = oauth_authorize_continue(
+            State(state.clone()),
+            Form(AuthorizeDecision {
+                request_id,
+                csrf_token,
+                portal_key: "test-portal".into(),
+                decision: "allow".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert!(!replay.headers().contains_key(LOCATION));
+
+        let deny_page = oauth_authorize(
+            Query(authorize_query(redirect_uri, "deny +&= state", &challenge)),
+            State(state.clone()),
+        )
+        .await
+        .into_response();
+        let deny_html = String::from_utf8(
+            to_bytes(deny_page.into_body(), 32_768)
+                .await
+                .expect("read deny page")
+                .to_vec(),
+        )
+        .expect("UTF-8 deny page");
+        let denied = oauth_authorize_continue(
+            State(state),
+            Form(AuthorizeDecision {
+                request_id: form_value(&deny_html, "request_id"),
+                csrf_token: form_value(&deny_html, "csrf_token"),
+                portal_key: "test-portal".into(),
+                decision: "deny".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(denied.status(), StatusCode::SEE_OTHER);
+        let denied_url = url::Url::parse(
+            denied.headers()[LOCATION]
+                .to_str()
+                .expect("denial location"),
+        )
+        .expect("parse denial redirect");
+        let denied_pairs: HashMap<_, _> = denied_url.query_pairs().into_owned().collect();
+        assert_eq!(denied_url.host_str(), Some("client.example.com"));
+        assert_eq!(denied_pairs.get("tenant").map(String::as_str), Some("one"));
+        assert_eq!(
+            denied_pairs.get("error").map(String::as_str),
+            Some("access_denied")
+        );
+        assert_eq!(
+            denied_pairs.get("state").map(String::as_str),
+            Some("deny +&= state")
+        );
+        assert_eq!(denied_pairs.get("iss").map(String::as_str), Some(issuer));
     }
 
     #[tokio::test]

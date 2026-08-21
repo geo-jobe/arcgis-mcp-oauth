@@ -88,7 +88,7 @@ Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the sa
 |------|---------|
 | 1. Discover the authorization server | `GET http://localhost:3325/.well-known/oauth-protected-resource` |
 | 2. Register a client | `POST http://localhost:3324/oauth/register` |
-| 3. Authorize | Open the authorize URL in a browser (portal picker → ArcGIS login) |
+| 3. Authorize | Open the authorize URL in a browser (explicit consent and portal selection, then ArcGIS login) |
 | 4. Exchange the code for a token | `POST http://localhost:3324/oauth/token` |
 | 5. Call the MCP server | `Authorization: Bearer mcp-token-...` on `http://localhost:3325/mcp` |
 
@@ -98,8 +98,8 @@ Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the sa
 |-------|-------------|
 | `GET /.well-known/oauth-authorization-server` | OAuth AS metadata |
 | `POST /oauth/register` | Dynamic client registration |
-| `GET /oauth/authorize` | Portal picker |
-| `GET /oauth/authorize/continue` | Redirect to ArcGIS |
+| `GET /oauth/authorize` | Review client, resource, scopes, and portal |
+| `POST /oauth/authorize/continue` | Submit consent decision |
 | `POST /oauth/token` | Token exchange |
 | `GET /arcgis/callback` | ArcGIS OAuth callback |
 | `GET /internal/session` | Session introspection |
@@ -146,6 +146,13 @@ Authorization success and redirect-based error responses include the RFC 9207 `i
 parameter. OAuth clients must compare it exactly with the `issuer` value from
 `/.well-known/oauth-authorization-server` and reject the response if the values differ. The server
 preserves registered callback query parameters and the client's `state` while adding `iss`.
+
+## Authorization consent
+
+Every authorization request requires an explicit allow or deny decision before any ArcGIS redirect.
+Validated request parameters are kept in short-lived, one-time server-side state and the consent form
+is protected by a CSRF token. Denial returns `access_denied` to the previously validated client
+redirect URI and preserves client `state`. Grants are not remembered; users review every request.
 
 ## Examples
 
