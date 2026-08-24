@@ -6,3 +6,4 @@
 /config/production.toml
 __pycache__/
 *.pyc
+scripts/

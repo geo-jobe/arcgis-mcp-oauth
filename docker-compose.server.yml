@@ -8,6 +8,7 @@ services:
       RUST_LOG: info
     volumes:
       - auth-data:/app/data
+      - ./config:/app/config:ro
     ports:
       - "${AUTH_PORT:-3324}:3324"
     healthcheck:
