@@ -87,7 +87,7 @@ Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the sa
 | Step | Request |
 |------|---------|
 | 1. Discover the authorization server | `GET http://localhost:3325/.well-known/oauth-protected-resource` |
-| 2. Register a client | `POST http://localhost:3324/oauth/register` |
+| 2. Identify the client | Use an HTTPS Client ID Metadata Document, or fall back to `POST http://localhost:3324/oauth/register` |
 | 3. Authorize | Open the authorize URL in a browser (explicit consent and portal selection, then ArcGIS login) |
 | 4. Exchange the code for a token | `POST http://localhost:3324/oauth/token` |
 | 5. Call the MCP server | `Authorization: Bearer mcp-token-...` on `http://localhost:3325/mcp` |
@@ -104,6 +104,33 @@ Point your MCP server at `AUTH_SERVICE_URL=http://localhost:3324` and use the sa
 | `GET /arcgis/callback` | ArcGIS OAuth callback |
 | `GET /internal/session` | Session introspection |
 | `GET /health` | Health check |
+
+## Client registration
+
+The authorization server prefers Client ID Metadata Documents (CIMD) for URL-shaped client IDs and
+retains Dynamic Client Registration (DCR) for compatibility. Discovery advertises both
+`client_id_metadata_document_supported: true` and the DCR `registration_endpoint`. Resolution is
+deterministic: HTTP(S) URL client IDs are resolved as CIMD documents; opaque IDs are looked up in the
+DCR registry.
+
+A CIMD client ID must be an HTTPS URL with a path. The JSON document must identify that URL exactly,
+provide a non-empty client name and redirect URI list, and describe this public authorization-code
+flow with `response_types: ["code"]` and `token_endpoint_auth_method: "none"`. Grant types may be
+`authorization_code` and `refresh_token`. Requested redirect URIs are compared exactly against the
+document. Registered redirects must use HTTPS, except for HTTP loopback redirects used by native
+clients.
+
+CIMD fetches use a 2-second connection timeout, a 5-second total timeout, a 5 KiB response limit,
+and at most three redirects. Every target and redirect is resolved and checked before connecting;
+production blocks loopback, private, link-local, reserved, and other non-public addresses. Successful
+documents are cached according to HTTP cache headers, with a 5-minute default TTL and `max-age`
+clamped to 1 minute through 1 hour. `ETag` and `Last-Modified` validators are used for revalidation.
+Failures and invalid documents are never cached, and an expired document fails closed if it cannot
+be refreshed.
+
+For local development only, set `CIMD_ALLOW_PRIVATE_ADDRESSES=true` (or
+`cimd_allow_private_addresses = true` in local TOML) to permit private targets and HTTP metadata on
+private targets. Production configuration rejects this setting at startup.
 
 ## Resource audiences
 

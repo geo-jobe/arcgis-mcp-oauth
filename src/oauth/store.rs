@@ -2,7 +2,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use thiserror::Error;
 use tokio::sync::RwLock;
+
+use crate::oauth::client_metadata::{
+    ClientMetadataError, ClientMetadataPolicy, ClientMetadataResolver,
+};
 
 // Fixed caps; upgrade path is env-config or per-IP limits at the proxy.
 const MAX_REGISTERED_CLIENTS: i64 = 1000;
@@ -173,6 +178,15 @@ mod tests {
 pub struct RegisteredClient {
     pub redirect_uris: Vec<String>,
     pub client_name: Option<String>,
+    pub metadata_url: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ClientResolveError {
+    #[error("client_id is not registered")]
+    Unknown,
+    #[error(transparent)]
+    Metadata(#[from] ClientMetadataError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,20 +197,57 @@ pub enum RegisterError {
 }
 
 /// Carries the server's public address for discovery metadata and the DCR client registry.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct McpOAuthStore {
     pub app_address: String,
     pool: SqlitePool,
     registration_timestamps: Arc<RwLock<Vec<i64>>>,
+    metadata_resolver: ClientMetadataResolver,
 }
 
 impl McpOAuthStore {
+    #[cfg(test)]
     pub fn new(pool: SqlitePool, app_address: &str) -> Self {
+        Self::with_client_metadata_policy(
+            pool,
+            app_address,
+            ClientMetadataPolicy {
+                allow_private_addresses: false,
+            },
+        )
+    }
+
+    pub fn with_client_metadata_policy(
+        pool: SqlitePool,
+        app_address: &str,
+        policy: ClientMetadataPolicy,
+    ) -> Self {
         Self {
             app_address: app_address.to_string(),
             pool,
             registration_timestamps: Arc::new(RwLock::new(Vec::new())),
+            metadata_resolver: ClientMetadataResolver::new(policy),
         }
+    }
+
+    /// Resolve URL-shaped client IDs through CIMD; all other IDs use DCR.
+    pub async fn resolve_client(
+        &self,
+        client_id: &str,
+    ) -> Result<RegisteredClient, ClientResolveError> {
+        let is_metadata_url = url::Url::parse(client_id).is_ok();
+        if is_metadata_url {
+            let metadata = self.metadata_resolver.resolve(client_id).await?;
+            return Ok(RegisteredClient {
+                redirect_uris: metadata.redirect_uris,
+                client_name: Some(metadata.client_name),
+                metadata_url: Some(client_id.to_string()),
+            });
+        }
+
+        self.get_registered_client(client_id)
+            .await
+            .ok_or(ClientResolveError::Unknown)
     }
 
     /// Store a DCR registration.
@@ -266,6 +317,7 @@ impl McpOAuthStore {
         Some(RegisteredClient {
             redirect_uris,
             client_name: row.get("client_name"),
+            metadata_url: None,
         })
     }
 }

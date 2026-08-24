@@ -20,6 +20,8 @@ pub enum ConfigError {
     },
     #[error("INTERNAL_API_KEY must be set")]
     MissingInternalApiKey,
+    #[error("cimd_allow_private_addresses cannot be enabled in production")]
+    UnsafeCimdProductionPolicy,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -101,6 +103,8 @@ pub struct Settings {
     pub address: String,
     pub port: u16,
     pub public_base_url: String,
+    #[serde(default)]
+    pub cimd_allow_private_addresses: bool,
     pub arcgis_portals: Vec<ArcgisPortalConfig>,
 }
 
@@ -128,6 +132,9 @@ pub fn get_config() -> Result<(Settings, String), ConfigError> {
 
     let mut settings: Settings = toml::from_str(&contents)?;
     apply_env_overrides(&mut settings)?;
+    if matches!(env, Environment::Production) && settings.cimd_allow_private_addresses {
+        return Err(ConfigError::UnsafeCimdProductionPolicy);
+    }
 
     let internal_api_key =
         std::env::var("INTERNAL_API_KEY").map_err(|_| ConfigError::MissingInternalApiKey)?;
@@ -156,6 +163,12 @@ fn apply_env_overrides(settings: &mut Settings) -> Result<(), ConfigError> {
         settings.public_base_url = value;
     } else if let Ok(value) = std::env::var("ARCGIS_PUBLIC_BASE_URL") {
         settings.public_base_url = value;
+    }
+    if let Ok(value) = std::env::var("CIMD_ALLOW_PRIVATE_ADDRESSES") {
+        settings.cimd_allow_private_addresses = value.parse().map_err(|e| ConfigError::EnvVar {
+            name: "CIMD_ALLOW_PRIVATE_ADDRESSES".into(),
+            source: Box::new(e),
+        })?;
     }
     Ok(())
 }

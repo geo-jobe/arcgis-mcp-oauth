@@ -20,6 +20,7 @@ use tower_http::cors::{Any as CorsAny, CorsLayer};
 use crate::arcgis_auth::{ArcGISAuthStore, arcgis_callback};
 use crate::config::Settings;
 use crate::internal::{InternalRouteState, internal_session};
+use crate::oauth::client_metadata::ClientMetadataPolicy;
 use crate::oauth::routes::{
     OAuthRouteState, oauth_authorization_server, oauth_authorize, oauth_authorize_continue,
     oauth_register, oauth_token,
@@ -101,7 +102,13 @@ pub async fn run(settings: Settings, internal_api_key: String) {
         .portal_registry()
         .expect("Invalid arcgis_portals configuration");
 
-    let mcp_store = Arc::new(McpOAuthStore::new(pool.clone(), &public_base_url));
+    let mcp_store = Arc::new(McpOAuthStore::with_client_metadata_policy(
+        pool.clone(),
+        &public_base_url,
+        ClientMetadataPolicy {
+            allow_private_addresses: settings.cimd_allow_private_addresses,
+        },
+    ));
     let arcgis_store = Arc::new(ArcGISAuthStore::new(
         pool,
         public_base_url.clone(),

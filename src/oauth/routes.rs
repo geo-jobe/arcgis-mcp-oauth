@@ -20,7 +20,8 @@ use crate::arcgis_auth::{
 };
 use crate::config::ArcgisPortalConfig;
 use crate::oauth::store::{
-    AuthorizeQuery, McpOAuthStore, RegisterError, RegisteredClient, TokenRequest,
+    AuthorizeQuery, ClientResolveError, McpOAuthStore, RegisterError, RegisteredClient,
+    TokenRequest,
 };
 use crate::oauth::store::{
     SUPPORTED_SCOPES, canonical_resource_uri, normalize_authorization_scope, normalize_scope,
@@ -38,6 +39,8 @@ struct AuthorizeTemplate {
     csrf_token: String,
     client_id: String,
     client_name: Option<String>,
+    client_host: Option<String>,
+    redirect_host: String,
     resource: String,
     scopes: Vec<String>,
     portals: Vec<ArcgisPortalConfig>,
@@ -66,6 +69,10 @@ pub async fn oauth_authorization_server(state: State<Arc<OAuthRouteState>>) -> i
             Value::String("authorization_code".into()),
             Value::String("refresh_token".into()),
         ]),
+    );
+    additional_fields.insert(
+        "client_id_metadata_document_supported".into(),
+        Value::Bool(true),
     );
     additional_fields.insert(
         "authorization_response_iss_parameter_supported".into(),
@@ -98,15 +105,24 @@ async fn validate_registered_client(
     client_id: &str,
     redirect_uri: &str,
 ) -> Result<RegisteredClient, (StatusCode, Value)> {
-    let registered = match mcp_store.get_registered_client(client_id).await {
-        Some(c) => c,
-        None => {
-            tracing::warn!("oauth authorize: unknown client_id={client_id}");
+    let registered = match mcp_store.resolve_client(client_id).await {
+        Ok(client) => client,
+        Err(error) => {
+            match &error {
+                ClientResolveError::Unknown => {
+                    tracing::warn!("oauth authorize: unknown client_id={client_id}");
+                }
+                ClientResolveError::Metadata(source) => {
+                    tracing::warn!(
+                        "oauth authorize: rejected CIMD client_id={client_id}: {source}"
+                    );
+                }
+            }
             return Err((
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({
                     "error": "invalid_client",
-                    "error_description": "client_id is not registered"
+                    "error_description": "client_id is not registered or its metadata is invalid"
                 }),
             ));
         }
@@ -225,6 +241,8 @@ pub async fn oauth_authorize(
         csrf_token,
         client_id: params.client_id,
         client_name: registered.client_name,
+        client_host: registered.metadata_url.as_deref().and_then(url_host),
+        redirect_host: url_host(&params.redirect_uri).unwrap_or_else(|| "unknown".into()),
         resource,
         scopes,
         portals: state.arcgis_store.portal_registry().list().to_vec(),
@@ -237,6 +255,12 @@ pub async fn oauth_authorize(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn url_host(value: &str) -> Option<String> {
+    url::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
 }
 
 pub async fn oauth_authorize_continue(
@@ -763,6 +787,7 @@ mod tests {
         ArcGISAuthStore, ArcGISTokenResponse, PortalContext, pkce_challenge_from_verifier,
     };
     use crate::config::{ArcgisPortalConfig, PortalRegistry};
+    use crate::oauth::client_metadata::ClientMetadataPolicy;
     use crate::oauth::store::{McpOAuthStore, TokenRequest};
 
     use super::*;
@@ -1095,6 +1120,7 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_slice(&metadata_bytes).expect("parse metadata");
         assert_eq!(metadata["issuer"], issuer);
+        assert_eq!(metadata["client_id_metadata_document_supported"], true);
         assert_eq!(
             metadata["authorization_response_iss_parameter_supported"],
             true
@@ -1439,5 +1465,95 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers()[LOCATION].to_str().expect("location");
         assert!(location.contains("error=invalid_target"));
+    }
+
+    #[tokio::test]
+    async fn cimd_client_authorizes_without_dcr_and_rejects_redirect_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata server");
+        let client_id = format!(
+            "http://{}/client.json",
+            listener.local_addr().expect("metadata server address")
+        );
+        let redirect_uri = "http://127.0.0.1:3210/callback";
+        let document = serde_json::json!({
+            "client_id": client_id,
+            "client_name": "CIMD Test Client",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        });
+        let app = Router::new().route(
+            "/client.json",
+            axum::routing::get(move || {
+                let document = document.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        document.to_string(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve metadata document");
+        });
+
+        let pool = test_pool().await;
+        let portal_registry =
+            PortalRegistry::from_portals(vec![test_portal("https://portal.example.com")])
+                .expect("portal registry");
+        let mcp_store = Arc::new(McpOAuthStore::with_client_metadata_policy(
+            pool.clone(),
+            "https://auth.example.com",
+            ClientMetadataPolicy {
+                allow_private_addresses: true,
+            },
+        ));
+        let state = Arc::new(OAuthRouteState {
+            mcp_store,
+            arcgis_store: Arc::new(ArcGISAuthStore::new(
+                pool,
+                "https://auth.example.com".into(),
+                portal_registry,
+            )),
+        });
+        let challenge = pkce_challenge_from_verifier("test-verifier");
+        let query = |redirect_uri: &str| AuthorizeQuery {
+            response_type: "code".into(),
+            client_id: client_id.clone(),
+            redirect_uri: redirect_uri.into(),
+            resource: "https://mcp.example.com/mcp".into(),
+            scope: Some("profile".into()),
+            state: Some("client-state".into()),
+            code_challenge: Some(challenge.clone()),
+            code_challenge_method: Some("S256".into()),
+        };
+
+        let valid = oauth_authorize(Query(query(redirect_uri)), State(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(valid.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(valid.into_body(), 32_768)
+                .await
+                .expect("read consent page")
+                .to_vec(),
+        )
+        .expect("consent page UTF-8");
+        assert!(html.contains("CIMD Test Client"));
+        assert!(html.contains("Redirect host:"));
+        assert!(!html.contains("Continue only if you started the connection"));
+
+        let mismatch =
+            oauth_authorize(Query(query("http://127.0.0.1:3211/callback")), State(state))
+                .await
+                .into_response();
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+        assert!(!mismatch.headers().contains_key(LOCATION));
     }
 }

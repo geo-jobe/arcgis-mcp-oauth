@@ -51,7 +51,7 @@
             margin: 0;
         }
 
-        .client-id, .resource {
+        .client-id, .resource, .host {
             display: block;
             color: #59686f;
             font-family: ui-monospace, monospace;
@@ -63,6 +63,12 @@
             margin-top: 1rem;
             padding-top: 1rem;
             border-top: 1px solid #eef0ee;
+        }
+
+        .identity {
+            margin-top: 0.8rem;
+            color: #35474f;
+            font-size: 0.9rem;
         }
 
         .scopes {
@@ -144,6 +150,12 @@
         <p class="client-name">{{ client_name }}</p>
         {% endif %}
         <code class="client-id">{{ client_id }}</code>
+        <div class="identity">
+            {% if let Some(client_host) = client_host %}
+            Client metadata host: <code class="host">{{ client_host }}</code><br>
+            {% endif %}
+            Redirect host: <code class="host">{{ redirect_host }}</code>
+        </div>
         <code class="resource">{{ resource }}</code>
         <div class="scopes" aria-label="Requested permissions">
             {% for scope in scopes %}<span class="scope">{{ scope }}</span>{% endfor %}

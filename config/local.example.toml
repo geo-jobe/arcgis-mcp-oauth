@@ -1,6 +1,7 @@
 address = "127.0.0.1"
 port = 3324
 public_base_url = "http://localhost:3324"
+cimd_allow_private_addresses = false
 
 # Replace this example with each ArcGIS portal that this deployment supports.
 [[arcgis_portals]]
