@@ -22,6 +22,8 @@ pub enum ConfigError {
     MissingInternalApiKey,
     #[error("cimd_allow_private_addresses cannot be enabled in production")]
     UnsafeCimdProductionPolicy,
+    #[error("invalid auth settings: {0}")]
+    InvalidAuthSettings(String),
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -97,7 +99,7 @@ impl PortalRegistry {
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct Settings {
     pub address: String,
@@ -105,7 +107,79 @@ pub struct Settings {
     pub public_base_url: String,
     #[serde(default)]
     pub cimd_allow_private_addresses: bool,
+    #[serde(default)]
+    pub auth: AuthSettings,
     pub arcgis_portals: Vec<ArcgisPortalConfig>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, rename_all = "snake_case")]
+pub struct AuthSettings {
+    pub mcp_access_token_lifetime_seconds: i64,
+    pub session_max_age_seconds: i64,
+    pub session_inactivity_timeout_seconds: i64,
+    pub mcp_refresh_replay_window_seconds: i64,
+    pub arcgis_access_refresh_buffer_seconds: i64,
+    pub arcgis_refresh_renewal_buffer_seconds: i64,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            mcp_access_token_lifetime_seconds: 60 * 60,
+            session_max_age_seconds: 90 * 24 * 60 * 60,
+            session_inactivity_timeout_seconds: 30 * 24 * 60 * 60,
+            mcp_refresh_replay_window_seconds: 30,
+            arcgis_access_refresh_buffer_seconds: 5 * 60,
+            arcgis_refresh_renewal_buffer_seconds: 24 * 60 * 60,
+        }
+    }
+}
+
+impl AuthSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        let values = [
+            (
+                "mcp_access_token_lifetime_seconds",
+                self.mcp_access_token_lifetime_seconds,
+            ),
+            ("session_max_age_seconds", self.session_max_age_seconds),
+            (
+                "session_inactivity_timeout_seconds",
+                self.session_inactivity_timeout_seconds,
+            ),
+            (
+                "mcp_refresh_replay_window_seconds",
+                self.mcp_refresh_replay_window_seconds,
+            ),
+            (
+                "arcgis_access_refresh_buffer_seconds",
+                self.arcgis_access_refresh_buffer_seconds,
+            ),
+            (
+                "arcgis_refresh_renewal_buffer_seconds",
+                self.arcgis_refresh_renewal_buffer_seconds,
+            ),
+        ];
+        if let Some((name, _)) = values.into_iter().find(|(_, value)| *value <= 0) {
+            return Err(format!("{name} must be greater than zero"));
+        }
+        if self.session_inactivity_timeout_seconds > self.session_max_age_seconds {
+            return Err(
+                "session_inactivity_timeout_seconds cannot exceed session_max_age_seconds".into(),
+            );
+        }
+        if self.mcp_refresh_replay_window_seconds >= self.mcp_access_token_lifetime_seconds {
+            return Err("mcp_refresh_replay_window_seconds must be shorter than mcp_access_token_lifetime_seconds".into());
+        }
+        let now = chrono::Utc::now().timestamp();
+        for (name, value) in values {
+            if now.checked_add(value).is_none() {
+                return Err(format!("{name} is too large"));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn get_config() -> Result<(Settings, String), ConfigError> {
@@ -132,6 +206,10 @@ pub fn get_config() -> Result<(Settings, String), ConfigError> {
 
     let mut settings: Settings = toml::from_str(&contents)?;
     apply_env_overrides(&mut settings)?;
+    settings
+        .auth
+        .validate()
+        .map_err(ConfigError::InvalidAuthSettings)?;
     if matches!(env, Environment::Production) && settings.cimd_allow_private_addresses {
         return Err(ConfigError::UnsafeCimdProductionPolicy);
     }
@@ -206,5 +284,32 @@ impl Settings {
 
     pub fn portal_registry(&self) -> Result<PortalRegistry, String> {
         PortalRegistry::from_portals(self.arcgis_portals.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthSettings;
+
+    #[test]
+    fn auth_settings_reject_zero_and_inconsistent_durations() {
+        let settings = AuthSettings {
+            mcp_access_token_lifetime_seconds: 0,
+            ..AuthSettings::default()
+        };
+        assert!(settings.validate().is_err());
+
+        let settings = AuthSettings {
+            session_inactivity_timeout_seconds: AuthSettings::default().session_max_age_seconds + 1,
+            ..AuthSettings::default()
+        };
+        assert!(settings.validate().is_err());
+
+        let settings = AuthSettings {
+            mcp_refresh_replay_window_seconds: AuthSettings::default()
+                .mcp_access_token_lifetime_seconds,
+            ..AuthSettings::default()
+        };
+        assert!(settings.validate().is_err());
     }
 }

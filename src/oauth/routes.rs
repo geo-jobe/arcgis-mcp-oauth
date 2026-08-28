@@ -496,6 +496,7 @@ pub async fn oauth_token(
             .arcgis_store
             .refresh_access_token(
                 &token_req.refresh_token,
+                &token_req.client_id,
                 &resource,
                 requested_scopes.as_deref(),
             )
@@ -670,32 +671,35 @@ pub async fn oauth_token(
             .into_response();
     }
 
-    let expires_in = pending.arcgis_token.expires_in;
     let mcp_access_token = format!("mcp-token-{}", Uuid::new_v4());
     let mcp_refresh_token = format!("mcp-refresh-{}", Uuid::new_v4());
 
-    if let Err(e) = state
+    let expires_in = match state
         .arcgis_store
         .store_issued_tokens(
             mcp_access_token.clone(),
             mcp_refresh_token.clone(),
             pending.arcgis_token,
+            pending.client_id,
             pending.portal,
             pending.resource,
             pending.scopes.clone(),
         )
         .await
     {
-        tracing::error!("Failed to store issued tokens: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "server_error",
-                "error_description": "failed to persist token"
-            })),
-        )
-            .into_response();
-    }
+        Ok(expires_in) => expires_in,
+        Err(e) => {
+            tracing::error!("Failed to store issued tokens: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "failed to persist token"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     tracing::info!("successfully issued mcp access token");
     (
@@ -835,8 +839,10 @@ mod tests {
         ArcGISTokenResponse {
             access_token: "arcgis-access-token".into(),
             expires_in: 3600,
-            refresh_token: Some("arcgis-refresh-token".into()),
+            refresh_token: "arcgis-refresh-token".into(),
+            refresh_token_expires_in: 1_209_600,
             username: Some("testuser".into()),
+            ssl: Some(true),
         }
     }
 
@@ -867,8 +873,8 @@ mod tests {
                 Json(serde_json::json!({
                     "access_token": "new-arcgis-access",
                     "expires_in": 7200,
-                    "refresh_token": "new-arcgis-refresh",
                     "username": "testuser",
+                    "ssl": true,
                 })),
             )
         }
@@ -1002,14 +1008,16 @@ mod tests {
         assert_eq!(body["expires_in"], 3600);
         assert_eq!(body["scope"], "profile");
         let stored = arcgis_store
-            .get_token(&access_token, &resource)
+            .resolve_session(&access_token, &resource)
             .await
+            .into_active()
             .expect("stored access token");
         assert_eq!(stored.scopes, ["profile"]);
         assert!(
             arcgis_store
-                .get_token(&access_token, "http://localhost:9999/mcp")
+                .resolve_session(&access_token, "http://localhost:9999/mcp")
                 .await
+                .into_active()
                 .is_none()
         );
 
@@ -1018,7 +1026,7 @@ mod tests {
             TokenRequest {
                 grant_type: "refresh_token".into(),
                 code: String::new(),
-                client_id: String::new(),
+                client_id: client_id.clone(),
                 redirect_uri: String::new(),
                 code_verifier: None,
                 refresh_token: refresh_token.clone(),
@@ -1031,8 +1039,9 @@ mod tests {
         assert_eq!(body["error"], "invalid_target");
         assert!(
             arcgis_store
-                .get_token(&access_token, &resource)
+                .resolve_session(&access_token, &resource)
                 .await
+                .into_active()
                 .is_some()
         );
 
@@ -1041,7 +1050,7 @@ mod tests {
             TokenRequest {
                 grant_type: "refresh_token".into(),
                 code: String::new(),
-                client_id: String::new(),
+                client_id: client_id.clone(),
                 redirect_uri: String::new(),
                 code_verifier: None,
                 refresh_token: refresh_token.clone(),
@@ -1054,8 +1063,9 @@ mod tests {
         assert_eq!(body["error"], "invalid_scope");
         assert!(
             arcgis_store
-                .get_token(&access_token, &resource)
+                .resolve_session(&access_token, &resource)
                 .await
+                .into_active()
                 .is_some()
         );
 
@@ -1064,7 +1074,7 @@ mod tests {
             TokenRequest {
                 grant_type: "refresh_token".into(),
                 code: String::new(),
-                client_id: String::new(),
+                client_id,
                 redirect_uri: String::new(),
                 code_verifier: None,
                 refresh_token,
@@ -1081,19 +1091,21 @@ mod tests {
             .as_str()
             .expect("refreshed refresh_token");
         assert_ne!(new_access, access_token);
-        assert_eq!(body["expires_in"], 7200);
+        assert_eq!(body["expires_in"], 3600);
         assert_eq!(body["scope"], "profile");
         assert!(
             arcgis_store
-                .get_token(new_access, &resource)
+                .resolve_session(new_access, &resource)
                 .await
+                .into_active()
                 .is_some()
         );
         assert!(
             arcgis_store
-                .get_token(&access_token, &resource)
+                .resolve_session(&access_token, &resource)
                 .await
-                .is_none()
+                .into_active()
+                .is_some()
         );
     }
 

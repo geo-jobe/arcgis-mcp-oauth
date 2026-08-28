@@ -1,6 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use arcgis_sharing_rs::auth::{exchange_oauth_authorization_code, exchange_oauth_refresh_token};
+use arcgis_sharing_rs::{
+    auth::{
+        exchange_oauth_authorization_code, exchange_oauth_refresh_token,
+        exchange_oauth_refresh_token_credential,
+    },
+    error::{Error as ArcGISClientError, OAuthError},
+};
 use axum::{
     Json,
     extract::{Query, State},
@@ -11,11 +20,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::config::{ArcgisPortalConfig, PortalRegistry};
+use crate::config::{ArcgisPortalConfig, AuthSettings, PortalRegistry};
 
 // Fixed TTLs/caps; upgrade path is env-config or per-IP rate limiting at the proxy.
 const PENDING_OAUTH_SESSION_TTL_SECS: i64 = 600;
@@ -24,8 +33,11 @@ const PENDING_CONSENT_TTL_SECS: i64 = 600;
 const MAX_PENDING_OAUTH_SESSIONS: usize = 1000;
 const MAX_PENDING_AUTH_CODES: usize = 1000;
 const MAX_PENDING_CONSENTS: usize = 1000;
+const ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS: i64 = 30;
+const FORCED_REFRESH_RATE_LIMIT_SECONDS: i64 = 5;
 
-pub type ArcGISTokenResponse = arcgis_sharing_rs::models::OAuthTokenResponse;
+pub type ArcGISTokenResponse = arcgis_sharing_rs::models::OAuthAuthorizationCodeResponse;
+pub type ArcGISAccessTokenResponse = arcgis_sharing_rs::models::OAuthAccessTokenResponse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingStoreError {
@@ -60,11 +72,42 @@ impl From<&ArcgisPortalConfig> for PortalContext {
 
 #[derive(Clone, Debug)]
 pub struct McpTokenRecord {
-    pub arcgis_token: ArcGISTokenResponse,
+    pub arcgis_token: ArcGISAccessTokenResponse,
     pub portal: PortalContext,
     pub expires_at: i64,
     pub resource: String,
     pub scopes: Vec<String>,
+}
+
+pub enum SessionResolution {
+    Active(Box<McpTokenRecord>),
+    Inactive,
+    TemporarilyUnavailable,
+    RateLimited,
+}
+
+impl SessionResolution {
+    #[cfg(test)]
+    pub(crate) fn into_active(self) -> Option<McpTokenRecord> {
+        match self {
+            Self::Active(record) => Some(*record),
+            Self::Inactive | Self::TemporarilyUnavailable | Self::RateLimited => None,
+        }
+    }
+}
+
+struct StoredSession {
+    session_id: String,
+    resource: String,
+    scopes: Vec<String>,
+    portal: PortalContext,
+    arcgis_access_token: String,
+    arcgis_access_expires_at: i64,
+    arcgis_refresh_token: String,
+    arcgis_refresh_expires_at: i64,
+    arcgis_username: Option<String>,
+    arcgis_ssl: Option<bool>,
+    arcgis_credential_generation: i64,
 }
 
 /// Stored when /oauth/authorize/continue is received; consumed by /arcgis/callback.
@@ -114,18 +157,32 @@ pub struct ArcGISAuthStore {
     pending_consents: Arc<RwLock<HashMap<String, PendingConsent>>>,
     pending_oauth_sessions: Arc<RwLock<HashMap<String, PendingOAuthSession>>>,
     pending_auth_codes: Arc<RwLock<HashMap<String, PendingAuthCode>>>,
+    refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pool: SqlitePool,
+    auth_settings: AuthSettings,
 }
 
 impl ArcGISAuthStore {
+    #[cfg(test)]
     pub fn new(pool: SqlitePool, base_url: String, portal_registry: PortalRegistry) -> Self {
+        Self::with_auth_settings(pool, base_url, portal_registry, AuthSettings::default())
+    }
+
+    pub fn with_auth_settings(
+        pool: SqlitePool,
+        base_url: String,
+        portal_registry: PortalRegistry,
+        auth_settings: AuthSettings,
+    ) -> Self {
         Self {
             base_url,
             portal_registry: Arc::new(portal_registry),
             pending_consents: Arc::new(RwLock::new(HashMap::new())),
             pending_oauth_sessions: Arc::new(RwLock::new(HashMap::new())),
             pending_auth_codes: Arc::new(RwLock::new(HashMap::new())),
+            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             pool,
+            auth_settings,
         }
     }
 
@@ -298,98 +355,421 @@ impl ArcGISAuthStore {
                 "swept expired pending OAuth state"
             );
         }
+
+        if let Err(error) =
+            sqlx::query("DELETE FROM mcp_access_tokens WHERE expires_at <= unixepoch()")
+                .execute(&self.pool)
+                .await
+        {
+            tracing::warn!(%error, "failed to sweep expired MCP access credentials");
+        }
+        if let Err(error) = sqlx::query(
+            "UPDATE mcp_refresh_tokens SET successor_access_token = NULL, successor_refresh_token = NULL \
+             WHERE state = 'consumed' AND consumed_at + ? < unixepoch()",
+        )
+        .bind(self.auth_settings.mcp_refresh_replay_window_seconds)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(%error, "failed to clear expired refresh replay responses");
+        }
+        if let Err(error) = sqlx::query(
+            "DELETE FROM sessions WHERE absolute_expires_at <= unixepoch() OR last_activity_at + ? <= unixepoch()",
+        )
+        .bind(self.auth_settings.session_inactivity_timeout_seconds)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(%error, "failed to sweep expired MCP sessions");
+        }
+        if let Ok(rows) = sqlx::query("SELECT session_id FROM sessions")
+            .fetch_all(&self.pool)
+            .await
+        {
+            let session_ids: HashSet<String> =
+                rows.into_iter().map(|row| row.get("session_id")).collect();
+            self.refresh_locks.lock().await.retain(|session_id, lock| {
+                session_ids.contains(session_id) && Arc::strong_count(lock) > 1
+            });
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_issued_tokens(
         &self,
         mcp_access_token: String,
         mcp_refresh_token: String,
         arcgis_token: ArcGISTokenResponse,
+        client_id: String,
         portal: PortalContext,
         resource: String,
         scopes: Vec<String>,
-    ) -> Result<(), String> {
-        let expires_at = chrono::Utc::now().timestamp() + arcgis_token.expires_in as i64;
-        let arcgis_token_json = serde_json::to_string(&arcgis_token).map_err(|e| e.to_string())?;
+    ) -> Result<u64, String> {
+        let now = chrono::Utc::now().timestamp();
+        let arcgis_access_lifetime = i64::try_from(arcgis_token.expires_in)
+            .map_err(|_| "ArcGIS access credential lifetime is too large")?;
+        let arcgis_refresh_lifetime = i64::try_from(arcgis_token.refresh_token_expires_in)
+            .map_err(|_| "ArcGIS refresh credential lifetime is too large")?;
+        if arcgis_access_lifetime
+            <= self
+                .auth_settings
+                .arcgis_access_refresh_buffer_seconds
+                .max(ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS)
+        {
+            return Err("ArcGIS access refresh buffer consumes the credential lifetime".into());
+        }
+        if arcgis_refresh_lifetime <= self.auth_settings.arcgis_refresh_renewal_buffer_seconds {
+            return Err("ArcGIS refresh renewal buffer consumes the credential lifetime".into());
+        }
+        let session_id = Uuid::new_v4().to_string();
+        let arcgis_access_expires_at = now
+            .checked_add(arcgis_access_lifetime)
+            .ok_or("ArcGIS access credential expiration is too large")?;
+        let arcgis_refresh_expires_at = now
+            .checked_add(arcgis_refresh_lifetime)
+            .ok_or("ArcGIS refresh credential expiration is too large")?;
+        let absolute_expires_at = now
+            .checked_add(self.auth_settings.session_max_age_seconds)
+            .ok_or("MCP session maximum age is too large")?;
+        let configured_access_expires_at = now
+            .checked_add(self.auth_settings.mcp_access_token_lifetime_seconds)
+            .ok_or("MCP access credential lifetime is too large")?;
+        let inactivity_expires_at = now
+            .checked_add(self.auth_settings.session_inactivity_timeout_seconds)
+            .ok_or("MCP session inactivity timeout is too large")?;
+        let mcp_access_expires_at = configured_access_expires_at
+            .min(absolute_expires_at)
+            .min(inactivity_expires_at);
+        let mcp_access_expires_in = u64::try_from(mcp_access_expires_at.saturating_sub(now))
+            .map_err(|_| "invalid MCP access credential lifetime")?;
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO tokens \
-             (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri, scope) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions \
+             (session_id, client_id, resource_uri, scope, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, arcgis_access_token, arcgis_access_expires_at, arcgis_refresh_token, arcgis_refresh_expires_at, arcgis_username, arcgis_ssl, created_at, last_activity_at, absolute_expires_at, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
         )
-        .bind(&mcp_access_token)
-        .bind(&arcgis_token_json)
-        .bind(expires_at)
+        .bind(&session_id)
+        .bind(&client_id)
+        .bind(&resource)
+        .bind(crate::oauth::store::scope_string(&scopes))
         .bind(&portal.key)
         .bind(&portal.portal_url)
         .bind(&portal.api_root)
         .bind(&portal.portal_apps)
         .bind(&portal.stories_root)
-        .bind(&resource)
-        .bind(crate::oauth::store::scope_string(&scopes))
+        .bind(&arcgis_token.access_token)
+        .bind(arcgis_access_expires_at)
+        .bind(&arcgis_token.refresh_token)
+        .bind(arcgis_refresh_expires_at)
+        .bind(&arcgis_token.username)
+        .bind(arcgis_token.ssl)
+        .bind(now)
+        .bind(now)
+        .bind(absolute_expires_at)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri, scope) \
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO mcp_access_tokens (mcp_access_token, session_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind(&mcp_access_token)
+        .bind(&session_id)
+        .bind(mcp_access_expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "INSERT INTO mcp_refresh_tokens (mcp_refresh_token, session_id, state) VALUES (?, ?, 'active')",
         )
         .bind(&mcp_refresh_token)
-        .bind(&mcp_access_token)
-        .bind(&resource)
-        .bind(crate::oauth::store::scope_string(&scopes))
+        .bind(&session_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(mcp_access_expires_in)
     }
 
-    pub async fn get_token(
+    pub async fn resolve_session(
         &self,
         mcp_access_token: &str,
         resource: &str,
-    ) -> Option<McpTokenRecord> {
-        if let Ok(result) = sqlx::query(
-            "DELETE FROM tokens WHERE mcp_access_token = ? AND expires_at <= unixepoch()",
-        )
-        .bind(mcp_access_token)
-        .execute(&self.pool)
-        .await
-            && result.rows_affected() > 0
+    ) -> SessionResolution {
+        self.resolve_session_inner(mcp_access_token, resource, false, true)
+            .await
+    }
+
+    pub async fn force_refresh_session(
+        &self,
+        mcp_access_token: &str,
+        resource: &str,
+    ) -> SessionResolution {
+        self.resolve_session_inner(mcp_access_token, resource, true, false)
+            .await
+    }
+
+    async fn resolve_session_inner(
+        &self,
+        mcp_access_token: &str,
+        resource: &str,
+        force_refresh: bool,
+        update_activity: bool,
+    ) -> SessionResolution {
+        let session = match self.load_session(mcp_access_token, resource).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return SessionResolution::Inactive,
+            Err(error) => {
+                tracing::error!(%error, "failed to load MCP session");
+                return SessionResolution::TemporarilyUnavailable;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        let observed_generation = session.arcgis_credential_generation;
+        if !force_refresh
+            && session.arcgis_access_expires_at - now
+                > self
+                    .auth_settings
+                    .arcgis_access_refresh_buffer_seconds
+                    .max(ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS)
         {
-            sqlx::query("DELETE FROM refresh_tokens WHERE mcp_access_token = ?")
-                .bind(mcp_access_token)
-                .execute(&self.pool)
-                .await
-                .ok();
+            return self.activate_session(session, now, update_activity).await;
         }
 
+        let lock = self.refresh_lock(&session.session_id).await;
+        let _guard = lock.lock().await;
+        let session = match self.load_session(mcp_access_token, resource).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return SessionResolution::Inactive,
+            Err(error) => {
+                tracing::error!(%error, "failed to reload MCP session");
+                return SessionResolution::TemporarilyUnavailable;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        if (!force_refresh || session.arcgis_credential_generation != observed_generation)
+            && session.arcgis_access_expires_at - now
+                > self
+                    .auth_settings
+                    .arcgis_access_refresh_buffer_seconds
+                    .max(ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS)
+        {
+            return self.activate_session(session, now, update_activity).await;
+        }
+        if force_refresh {
+            let allowed = sqlx::query(
+                "UPDATE sessions SET last_forced_refresh_at = ? WHERE session_id = ? \
+                 AND (last_forced_refresh_at IS NULL OR last_forced_refresh_at + ? <= ?)",
+            )
+            .bind(now)
+            .bind(&session.session_id)
+            .bind(FORCED_REFRESH_RATE_LIMIT_SECONDS)
+            .bind(now)
+            .execute(&self.pool)
+            .await;
+            match allowed {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => return SessionResolution::RateLimited,
+                Err(error) => {
+                    tracing::error!(%error, "failed to rate-limit forced refresh");
+                    return SessionResolution::TemporarilyUnavailable;
+                }
+            }
+        }
+
+        let Some(portal) = self.portal_registry.get(&session.portal.key) else {
+            tracing::error!(portal = %session.portal.key, "session portal is no longer configured");
+            return SessionResolution::TemporarilyUnavailable;
+        };
+        let token_url = format!(
+            "{}/sharing/rest/oauth2/token",
+            session.portal.portal_url.trim_end_matches('/')
+        );
+        let renew_refresh = session.arcgis_refresh_expires_at - now
+            <= self.auth_settings.arcgis_refresh_renewal_buffer_seconds;
+
+        let refreshed = if renew_refresh {
+            let redirect_uri = format!("{}/arcgis/callback", self.base_url);
+            exchange_oauth_refresh_token_credential(
+                &token_url,
+                &portal.client_id,
+                &redirect_uri,
+                &session.arcgis_refresh_token,
+            )
+            .instrument(tracing::info_span!(
+                "arcgis.refresh_credential_exchange",
+                "http.request.method" = "POST",
+                "url.full" = %token_url,
+            ))
+            .await
+            .map(|response| {
+                (
+                    response.access_token,
+                    response.expires_in,
+                    response.refresh_token,
+                    response.refresh_token_expires_in,
+                    response.username.or(session.arcgis_username.clone()),
+                    response.ssl.or(session.arcgis_ssl),
+                )
+            })
+        } else {
+            exchange_oauth_refresh_token(
+                &token_url,
+                &portal.client_id,
+                &session.arcgis_refresh_token,
+            )
+            .instrument(tracing::info_span!(
+                "arcgis.access_credential_refresh",
+                "http.request.method" = "POST",
+                "url.full" = %token_url,
+            ))
+            .await
+            .map(|response| {
+                (
+                    response.access_token,
+                    response.expires_in,
+                    session.arcgis_refresh_token.clone(),
+                    u64::try_from(session.arcgis_refresh_expires_at.saturating_sub(now))
+                        .unwrap_or(0),
+                    response.username.or(session.arcgis_username.clone()),
+                    response.ssl.or(session.arcgis_ssl),
+                )
+            })
+        };
+
+        let (access_token, access_lifetime, refresh_token, refresh_lifetime, username, ssl) =
+            match refreshed {
+                Ok(credentials) => credentials,
+                Err(error) if Self::is_invalid_refresh_credential(&error) => {
+                    if let Err(revoke_error) =
+                        sqlx::query("UPDATE sessions SET status = 'revoked' WHERE session_id = ?")
+                            .bind(&session.session_id)
+                            .execute(&self.pool)
+                            .await
+                    {
+                        tracing::error!(%revoke_error, "failed to revoke rejected MCP session");
+                    }
+                    return SessionResolution::Inactive;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %session.session_id, "ArcGIS credential refresh failed temporarily");
+                    if session.arcgis_access_expires_at - now >= ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS
+                    {
+                        return self.activate_session(session, now, update_activity).await;
+                    }
+                    return SessionResolution::TemporarilyUnavailable;
+                }
+            };
+
+        let Ok(access_lifetime) = i64::try_from(access_lifetime) else {
+            return SessionResolution::TemporarilyUnavailable;
+        };
+        let Ok(refresh_lifetime) = i64::try_from(refresh_lifetime) else {
+            return SessionResolution::TemporarilyUnavailable;
+        };
+        if access_lifetime
+            <= self
+                .auth_settings
+                .arcgis_access_refresh_buffer_seconds
+                .max(ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS)
+            || refresh_lifetime <= self.auth_settings.arcgis_refresh_renewal_buffer_seconds
+        {
+            tracing::warn!(session_id = %session.session_id, "ArcGIS returned credentials shorter than configured buffers");
+            if session.arcgis_access_expires_at - now >= ARCGIS_TOKEN_SAFETY_MARGIN_SECONDS {
+                return self.activate_session(session, now, update_activity).await;
+            }
+            return SessionResolution::TemporarilyUnavailable;
+        }
+        let Some(access_expires_at) = now.checked_add(access_lifetime) else {
+            return SessionResolution::TemporarilyUnavailable;
+        };
+        let refresh_expires_at = if renew_refresh {
+            let Some(expires_at) = now.checked_add(refresh_lifetime) else {
+                return SessionResolution::TemporarilyUnavailable;
+            };
+            expires_at
+        } else {
+            session.arcgis_refresh_expires_at
+        };
+        let updated = sqlx::query(
+            "UPDATE sessions SET arcgis_access_token = ?, arcgis_access_expires_at = ?, \
+                    arcgis_refresh_token = ?, arcgis_refresh_expires_at = ?, arcgis_username = ?, \
+                    arcgis_ssl = ?, arcgis_credential_generation = arcgis_credential_generation + 1, \
+                    last_activity_at = CASE WHEN ? THEN ? ELSE last_activity_at END \
+             WHERE session_id = ? AND status = 'active' AND absolute_expires_at > ? \
+               AND last_activity_at + ? > ?",
+        )
+        .bind(&access_token)
+        .bind(access_expires_at)
+        .bind(&refresh_token)
+        .bind(refresh_expires_at)
+        .bind(&username)
+        .bind(ssl)
+        .bind(update_activity)
+        .bind(now)
+        .bind(&session.session_id)
+        .bind(now)
+        .bind(self.auth_settings.session_inactivity_timeout_seconds)
+        .bind(now)
+        .execute(&self.pool)
+        .await;
+        match updated {
+            Ok(result) if result.rows_affected() == 1 => {
+                SessionResolution::Active(Box::new(McpTokenRecord {
+                    arcgis_token: ArcGISAccessTokenResponse {
+                        access_token,
+                        expires_in: u64::try_from(access_lifetime).unwrap_or(0),
+                        username,
+                        ssl,
+                    },
+                    portal: session.portal,
+                    expires_at: access_expires_at,
+                    resource: session.resource,
+                    scopes: session.scopes,
+                }))
+            }
+            Ok(_) => SessionResolution::Inactive,
+            Err(error) => {
+                tracing::error!(%error, "failed to persist refreshed ArcGIS credentials");
+                SessionResolution::TemporarilyUnavailable
+            }
+        }
+    }
+
+    async fn load_session(
+        &self,
+        mcp_access_token: &str,
+        resource: &str,
+    ) -> Result<Option<StoredSession>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, scope \
-             FROM tokens WHERE mcp_access_token = ? AND resource_uri = ?",
+            "SELECT s.session_id, s.scope, s.portal_key, s.portal_url, s.portal_api_root, s.portal_apps, s.portal_stories_root, \
+                    s.arcgis_access_token, s.arcgis_access_expires_at, s.arcgis_refresh_token, s.arcgis_refresh_expires_at, \
+                    s.arcgis_username, s.arcgis_ssl, s.arcgis_credential_generation, s.resource_uri \
+             FROM mcp_access_tokens a JOIN sessions s ON s.session_id = a.session_id \
+             WHERE a.mcp_access_token = ? AND s.resource_uri = ? AND s.status = 'active' \
+               AND a.expires_at > unixepoch() \
+               AND s.absolute_expires_at > unixepoch() \
+               AND s.last_activity_at + ? > unixepoch()",
         )
         .bind(mcp_access_token)
         .bind(resource)
+        .bind(self.auth_settings.session_inactivity_timeout_seconds)
         .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()?;
-
-        let arcgis_token_json: String = row.get("arcgis_token");
-        let arcgis_token: ArcGISTokenResponse = serde_json::from_str(&arcgis_token_json).ok()?;
-        let expires_at: i64 = row.get("expires_at");
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
         let scope: String = row.get("scope");
-        let scopes = crate::oauth::store::normalize_scope(&scope).ok()?;
-
-        Some(McpTokenRecord {
-            arcgis_token,
-            expires_at,
-            resource: resource.to_string(),
+        let Ok(scopes) = crate::oauth::store::normalize_scope(&scope) else {
+            return Ok(None);
+        };
+        Ok(Some(StoredSession {
+            session_id: row.get("session_id"),
+            resource: row.get("resource_uri"),
             scopes,
             portal: PortalContext {
                 key: row.get("portal_key"),
@@ -398,183 +778,233 @@ impl ArcGISAuthStore {
                 portal_apps: row.get("portal_apps"),
                 stories_root: row.get("portal_stories_root"),
             },
-        })
+            arcgis_access_token: row.get("arcgis_access_token"),
+            arcgis_access_expires_at: row.get("arcgis_access_expires_at"),
+            arcgis_refresh_token: row.get("arcgis_refresh_token"),
+            arcgis_refresh_expires_at: row.get("arcgis_refresh_expires_at"),
+            arcgis_username: row.get("arcgis_username"),
+            arcgis_ssl: row.get("arcgis_ssl"),
+            arcgis_credential_generation: row.get("arcgis_credential_generation"),
+        }))
+    }
+
+    async fn activate_session(
+        &self,
+        session: StoredSession,
+        now: i64,
+        update_activity: bool,
+    ) -> SessionResolution {
+        let updated = sqlx::query(
+            "UPDATE sessions SET last_activity_at = CASE WHEN ? THEN ? ELSE last_activity_at END \
+             WHERE session_id = ? AND status = 'active' \
+             AND absolute_expires_at > ? AND last_activity_at + ? > ?",
+        )
+        .bind(update_activity)
+        .bind(now)
+        .bind(&session.session_id)
+        .bind(now)
+        .bind(self.auth_settings.session_inactivity_timeout_seconds)
+        .bind(now)
+        .execute(&self.pool)
+        .await;
+        match updated {
+            Ok(result) if result.rows_affected() == 1 => {
+                SessionResolution::Active(Box::new(McpTokenRecord {
+                    arcgis_token: ArcGISAccessTokenResponse {
+                        access_token: session.arcgis_access_token,
+                        expires_in: u64::try_from(
+                            session.arcgis_access_expires_at.saturating_sub(now),
+                        )
+                        .unwrap_or(0),
+                        username: session.arcgis_username,
+                        ssl: session.arcgis_ssl,
+                    },
+                    expires_at: session.arcgis_access_expires_at,
+                    resource: session.resource,
+                    scopes: session.scopes,
+                    portal: session.portal,
+                }))
+            }
+            Ok(_) => SessionResolution::Inactive,
+            Err(error) => {
+                tracing::error!(%error, "failed to update MCP session activity");
+                SessionResolution::TemporarilyUnavailable
+            }
+        }
+    }
+
+    fn is_invalid_refresh_credential(error: &ArcGISClientError) -> bool {
+        matches!(
+            error,
+            ArcGISClientError::OAuth { source, .. }
+                if matches!(source.as_ref(), OAuthError::InvalidRefreshCredential { .. })
+        )
     }
 
     pub async fn refresh_access_token(
         &self,
         mcp_refresh_token: &str,
+        client_id: &str,
         resource: &str,
         requested_scopes: Option<&[String]>,
     ) -> Result<(String, String, u64, Vec<String>), String> {
-        let refresh_row = sqlx::query(
-            "SELECT mcp_access_token, resource_uri, scope FROM refresh_tokens WHERE mcp_refresh_token = ?",
+        let refresh_row =
+            sqlx::query("SELECT session_id FROM mcp_refresh_tokens WHERE mcp_refresh_token = ?")
+                .bind(mcp_refresh_token)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        let refresh_row = refresh_row.ok_or("Invalid refresh token")?;
+        let session_id: String = refresh_row.get("session_id");
+        let lock = self.refresh_lock(&session_id).await;
+        let _guard = lock.lock().await;
+
+        let row = sqlx::query(
+            "SELECT r.state, r.consumed_at, r.successor_access_token, r.successor_refresh_token, \
+                    s.client_id, s.resource_uri, s.scope, s.status, s.last_activity_at, s.absolute_expires_at \
+             FROM mcp_refresh_tokens r JOIN sessions s ON s.session_id = r.session_id \
+             WHERE r.mcp_refresh_token = ?",
         )
         .bind(mcp_refresh_token)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        let refresh_row = refresh_row.ok_or("Invalid refresh token")?;
-        let old_access_token: String = refresh_row.get("mcp_access_token");
-        let bound_resource: String = refresh_row.get("resource_uri");
-        if bound_resource != resource {
+        let row = row.ok_or("Invalid refresh token")?;
+        if row.get::<String, _>("client_id") != client_id {
+            return Err("client does not match refresh token".into());
+        }
+        if row.get::<String, _>("resource_uri") != resource {
             return Err("resource does not match refresh token".into());
         }
-        let refresh_scope: String = refresh_row.get("scope");
-        let granted_scopes = crate::oauth::store::normalize_scope(&refresh_scope)
+        let granted_scopes = crate::oauth::store::normalize_scope(&row.get::<String, _>("scope"))
             .map_err(|_| "Invalid scope stored for refresh token")?;
         let scopes = match requested_scopes {
             Some(requested) if requested.iter().all(|scope| granted_scopes.contains(scope)) => {
                 requested.to_vec()
             }
             Some(_) => return Err("requested scope exceeds original grant".into()),
-            None => granted_scopes.clone(),
+            None => granted_scopes,
         };
-
-        let row = sqlx::query(
-            "SELECT arcgis_token, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, scope \
-             FROM tokens WHERE mcp_access_token = ? AND resource_uri = ?",
-        )
-        .bind(&old_access_token)
-        .bind(resource)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let row = row.ok_or("Access token not found for refresh")?;
-        let access_scope: String = row.get("scope");
-        if crate::oauth::store::normalize_scope(&access_scope)
-            .map_err(|_| "Invalid scope stored for access token")?
-            != granted_scopes
+        let now = chrono::Utc::now().timestamp();
+        let absolute_expires_at: i64 = row.get("absolute_expires_at");
+        let inactivity_expires_at = row
+            .get::<i64, _>("last_activity_at")
+            .checked_add(self.auth_settings.session_inactivity_timeout_seconds)
+            .ok_or("MCP session inactivity deadline is too large")?;
+        if row.get::<String, _>("status") != "active"
+            || absolute_expires_at <= now
+            || inactivity_expires_at <= now
         {
-            return Err("access and refresh token scopes do not match".into());
+            return Err("MCP session is inactive or expired".into());
         }
-        let arcgis_token_json: String = row.get("arcgis_token");
-        let arcgis_token: ArcGISTokenResponse =
-            serde_json::from_str(&arcgis_token_json).map_err(|e| e.to_string())?;
-        let portal = PortalContext {
-            key: row.get("portal_key"),
-            portal_url: row.get("portal_url"),
-            api_root: row.get("portal_api_root"),
-            portal_apps: row.get("portal_apps"),
-            stories_root: row.get("portal_stories_root"),
-        };
 
-        let arcgis_refresh_token = match arcgis_token.refresh_token.as_deref() {
-            Some(token) if !token.is_empty() => token,
-            _ => {
-                Self::cleanup_session(&self.pool, &old_access_token, mcp_refresh_token).await?;
-                return Err("ArcGIS refresh token missing; re-authenticate".into());
+        if row.get::<String, _>("state") == "consumed" {
+            let consumed_at: Option<i64> = row.get("consumed_at");
+            if consumed_at.is_some_and(|consumed_at| {
+                now - consumed_at <= self.auth_settings.mcp_refresh_replay_window_seconds
+            }) {
+                let access: Option<String> = row.get("successor_access_token");
+                let refresh: Option<String> = row.get("successor_refresh_token");
+                if let (Some(access), Some(refresh)) = (access, refresh) {
+                    let expires_at: i64 = sqlx::query_scalar(
+                        "SELECT expires_at FROM mcp_access_tokens WHERE mcp_access_token = ?",
+                    )
+                    .bind(&access)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    return Ok((
+                        access,
+                        refresh,
+                        u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0),
+                        scopes,
+                    ));
+                }
             }
-        };
-
-        let portal_config = self
-            .portal_registry
-            .get(&portal.key)
-            .ok_or_else(|| format!("Portal '{}' not found in registry", portal.key))?;
-
-        let token_url = format!(
-            "{}/sharing/rest/oauth2/token",
-            portal.portal_url.trim_end_matches('/')
-        );
-
-        let new_arcgis_token = match exchange_oauth_refresh_token(
-            &token_url,
-            &portal_config.client_id,
-            arcgis_refresh_token,
-        )
-        .instrument(tracing::info_span!(
-            "arcgis.token_refresh",
-            "http.request.method" = "POST",
-            "url.full" = %token_url,
-        ))
-        .await
-        {
-            Ok(token) => token,
-            Err(e) => {
-                Self::cleanup_session(&self.pool, &old_access_token, mcp_refresh_token).await?;
-                return Err(format!("ArcGIS session expired; re-authenticate: {e}"));
-            }
-        };
-
-        let expires_in = new_arcgis_token.expires_in;
-        let new_token_json = serde_json::to_string(&new_arcgis_token).map_err(|e| e.to_string())?;
-        let expires_at = chrono::Utc::now().timestamp() + expires_in as i64;
+            sqlx::query("UPDATE sessions SET status = 'revoked' WHERE session_id = ?")
+                .bind(&session_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Err("refresh token replay detected; MCP session revoked".into());
+        }
 
         let new_access = format!("mcp-token-{}", Uuid::new_v4());
         let new_refresh = format!("mcp-refresh-{}", Uuid::new_v4());
+        let credential_expires_at = now
+            .checked_add(self.auth_settings.mcp_access_token_lifetime_seconds)
+            .ok_or("MCP access credential lifetime is too large")?;
+        let expires_at = credential_expires_at
+            .min(absolute_expires_at)
+            .min(inactivity_expires_at);
+        let expires_in = u64::try_from(expires_at.saturating_sub(now))
+            .map_err(|_| "invalid MCP access credential lifetime")?;
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
-        sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ?")
-            .bind(&old_access_token)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        sqlx::query("DELETE FROM refresh_tokens WHERE mcp_refresh_token = ?")
+        let consumed = sqlx::query(
+            "UPDATE mcp_refresh_tokens SET state = 'consumed', consumed_at = ?, successor_access_token = ?, successor_refresh_token = ? \
+             WHERE mcp_refresh_token = ? AND state = 'active' \
+               AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = mcp_refresh_tokens.session_id \
+                           AND s.status = 'active' AND s.absolute_expires_at > unixepoch() \
+                           AND s.last_activity_at + ? > unixepoch())",
+        )
+            .bind(now)
+            .bind(&new_access)
+            .bind(&new_refresh)
             .bind(mcp_refresh_token)
+            .bind(self.auth_settings.session_inactivity_timeout_seconds)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
+        if consumed.rows_affected() != 1 {
+            return Err("MCP session expired during refresh".into());
+        }
 
         sqlx::query(
-            "INSERT INTO tokens \
-              (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri, scope) \
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mcp_access_tokens (mcp_access_token, session_id, expires_at) VALUES (?, ?, ?)",
         )
         .bind(&new_access)
-        .bind(&new_token_json)
+        .bind(&session_id)
         .bind(expires_at)
-        .bind(&portal.key)
-        .bind(&portal.portal_url)
-        .bind(&portal.api_root)
-        .bind(&portal.portal_apps)
-        .bind(&portal.stories_root)
-        .bind(resource)
-        .bind(crate::oauth::store::scope_string(&scopes))
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri, scope) VALUES (?, ?, ?, ?)",
+            "INSERT INTO mcp_refresh_tokens (mcp_refresh_token, session_id, state) VALUES (?, ?, 'active')",
         )
         .bind(&new_refresh)
-        .bind(&new_access)
-        .bind(resource)
-        .bind(crate::oauth::store::scope_string(&scopes))
+        .bind(&session_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+
+        if scopes
+            != crate::oauth::store::normalize_scope(&row.get::<String, _>("scope"))
+                .map_err(|_| "Invalid scope stored for refresh token")?
+        {
+            sqlx::query("UPDATE sessions SET scope = ? WHERE session_id = ?")
+                .bind(crate::oauth::store::scope_string(&scopes))
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
 
         tx.commit().await.map_err(|e| e.to_string())?;
 
         Ok((new_access, new_refresh, expires_in, scopes))
     }
 
-    async fn cleanup_session(
-        pool: &SqlitePool,
-        mcp_access_token: &str,
-        mcp_refresh_token: &str,
-    ) -> Result<(), String> {
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-
-        sqlx::query("DELETE FROM tokens WHERE mcp_access_token = ?")
-            .bind(mcp_access_token)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        sqlx::query("DELETE FROM refresh_tokens WHERE mcp_refresh_token = ?")
-            .bind(mcp_refresh_token)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(())
+    async fn refresh_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.refresh_locks.lock().await;
+        locks
+            .entry(session_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -675,13 +1105,6 @@ pub async fn arcgis_callback(
             return authorization_error_redirect(&session, &store.base_url, "server_error");
         }
     };
-
-    if arcgis_token.refresh_token.is_none() {
-        tracing::warn!(
-            portal = %session.portal.key,
-            "ArcGIS omitted refresh_token; MCP refresh will fail"
-        );
-    }
 
     let username = arcgis_token.username.clone().unwrap_or_default();
     let portal_context = PortalContext::from(&session.portal);
@@ -804,7 +1227,10 @@ pub fn pkce_challenge_from_verifier(verifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         Json, Router,
@@ -816,11 +1242,11 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tokio::net::TcpListener;
 
-    use crate::config::{ArcgisPortalConfig, PortalRegistry};
+    use crate::config::{ArcgisPortalConfig, AuthSettings, PortalRegistry};
 
     use super::{
-        ArcGISAuthStore, CallbackQuery, arcgis_callback, authorization_response_url, is_expired,
-        pkce_challenge_from_verifier,
+        ArcGISAuthStore, ArcGISTokenResponse, CallbackQuery, PortalContext, arcgis_callback,
+        authorization_response_url, is_expired, pkce_challenge_from_verifier,
     };
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -867,7 +1293,9 @@ mod tests {
                     "access_token": "arcgis-access-token",
                     "expires_in": 3600,
                     "refresh_token": "arcgis-refresh-token",
+                    "refresh_token_expires_in": 1209600,
                     "username": "testuser",
+                    "ssl": true,
                 })),
             )
         }
@@ -883,6 +1311,107 @@ mod tests {
                 .expect("serve mock ArcGIS server");
         });
         format!("http://{address}")
+    }
+
+    fn sample_arcgis_credentials() -> ArcGISTokenResponse {
+        ArcGISTokenResponse {
+            access_token: "arcgis-access-token".into(),
+            expires_in: 3600,
+            refresh_token: "arcgis-refresh-token".into(),
+            refresh_token_expires_in: 1_209_600,
+            username: Some("testuser".into()),
+            ssl: Some(true),
+        }
+    }
+
+    async fn store_credential_family(store: &ArcGISAuthStore) {
+        store_credential_family_for_portal(store, "https://portal.example.com").await;
+    }
+
+    async fn store_credential_family_for_portal(store: &ArcGISAuthStore, portal_url: &str) {
+        store
+            .store_issued_tokens(
+                "mcp-access".into(),
+                "mcp-refresh".into(),
+                sample_arcgis_credentials(),
+                "client-id".into(),
+                PortalContext::from(&test_portal(portal_url)),
+                "https://mcp.example.com/mcp".into(),
+                vec!["profile".into()],
+            )
+            .await
+            .expect("store credential family");
+    }
+
+    #[derive(Clone)]
+    struct TokenServerState {
+        status: StatusCode,
+        body: serde_json::Value,
+        requests: Arc<AtomicUsize>,
+        delay_millis: u64,
+    }
+
+    async fn mock_token_response_server(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> (String, Arc<AtomicUsize>) {
+        async fn token_handler(State(state): State<TokenServerState>) -> impl IntoResponse {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            if state.delay_millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(state.delay_millis)).await;
+            }
+            (state.status, Json(state.body))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock token server");
+        let address = listener.local_addr().expect("mock token server address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/sharing/rest/oauth2/token", post(token_handler))
+            .with_state(TokenServerState {
+                status,
+                body,
+                requests: requests.clone(),
+                delay_millis: 0,
+            });
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock token server");
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    async fn mock_delayed_token_response_server(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed token server");
+        let address = listener.local_addr().expect("delayed token server address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn token_handler(State(state): State<TokenServerState>) -> impl IntoResponse {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(state.delay_millis)).await;
+            (state.status, Json(state.body))
+        }
+        let app = Router::new()
+            .route("/sharing/rest/oauth2/token", post(token_handler))
+            .with_state(TokenServerState {
+                status,
+                body,
+                requests: requests.clone(),
+                delay_millis: 100,
+            });
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed token server");
+        });
+        (format!("http://{address}"), requests)
     }
 
     #[test]
@@ -1029,5 +1558,468 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key(LOCATION));
+    }
+
+    #[tokio::test]
+    async fn expired_access_credential_does_not_invalidate_refresh_credential() {
+        let store = test_store("https://portal.example.com", "https://auth.example.com").await;
+        store_credential_family(&store).await;
+        sqlx::query("UPDATE mcp_access_tokens SET expires_at = unixepoch() - 1")
+            .execute(&store.pool)
+            .await
+            .expect("expire access credential");
+
+        let refreshed = store
+            .refresh_access_token(
+                "mcp-refresh",
+                "client-id",
+                "https://mcp.example.com/mcp",
+                None,
+            )
+            .await
+            .expect("refresh MCP credentials");
+
+        assert_ne!(refreshed.0, "mcp-access");
+        assert_eq!(refreshed.2, 3600);
+    }
+
+    #[tokio::test]
+    async fn refresh_enforces_client_resource_and_scope_bindings() {
+        let store = test_store("https://portal.example.com", "https://auth.example.com").await;
+        store_credential_family(&store).await;
+
+        for (client, resource, scopes, expected) in [
+            (
+                "other-client",
+                "https://mcp.example.com/mcp",
+                None,
+                "client does not match refresh token",
+            ),
+            (
+                "client-id",
+                "https://other.example.com/mcp",
+                None,
+                "resource does not match refresh token",
+            ),
+            (
+                "client-id",
+                "https://mcp.example.com/mcp",
+                Some(vec!["admin".into()]),
+                "requested scope exceeds original grant",
+            ),
+        ] {
+            let error = store
+                .refresh_access_token("mcp-refresh", client, resource, scopes.as_deref())
+                .await
+                .expect_err("binding mismatch");
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_replay_returns_one_successor_pair() {
+        let store = test_store("https://portal.example.com", "https://auth.example.com").await;
+        store_credential_family(&store).await;
+        let first_store = store.clone();
+        let second_store = store.clone();
+
+        let first = tokio::spawn(async move {
+            first_store
+                .refresh_access_token(
+                    "mcp-refresh",
+                    "client-id",
+                    "https://mcp.example.com/mcp",
+                    None,
+                )
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_store
+                .refresh_access_token(
+                    "mcp-refresh",
+                    "client-id",
+                    "https://mcp.example.com/mcp",
+                    None,
+                )
+                .await
+        });
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first task").expect("first refresh");
+        let second = second.expect("second task").expect("second refresh");
+
+        assert_eq!((&first.0, &first.1), (&second.0, &second.1));
+    }
+
+    #[tokio::test]
+    async fn replay_after_window_revokes_credential_family() {
+        let settings = AuthSettings {
+            mcp_refresh_replay_window_seconds: 1,
+            ..AuthSettings::default()
+        };
+        let pool = test_pool().await;
+        let registry =
+            PortalRegistry::from_portals(vec![test_portal("https://portal.example.com")])
+                .expect("portal registry");
+        let store = ArcGISAuthStore::with_auth_settings(
+            pool,
+            "https://auth.example.com".into(),
+            registry,
+            settings,
+        );
+        store_credential_family(&store).await;
+        store
+            .refresh_access_token(
+                "mcp-refresh",
+                "client-id",
+                "https://mcp.example.com/mcp",
+                None,
+            )
+            .await
+            .expect("initial refresh");
+        sqlx::query(
+            "UPDATE mcp_refresh_tokens SET consumed_at = unixepoch() - 2 WHERE mcp_refresh_token = 'mcp-refresh'",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("age consumed credential");
+
+        let error = store
+            .refresh_access_token(
+                "mcp-refresh",
+                "client-id",
+                "https://mcp.example.com/mcp",
+                None,
+            )
+            .await
+            .expect_err("late replay");
+        let status: String = sqlx::query_scalar("SELECT status FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .expect("session status");
+
+        assert_eq!(error, "refresh token replay detected; MCP session revoked");
+        assert_eq!(status, "revoked");
+    }
+
+    #[tokio::test]
+    async fn stable_session_migration_invalidates_legacy_credentials() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("connect legacy database");
+        for migration in [
+            include_str!("../migrations/0001_init.sql"),
+            include_str!("../migrations/0002_token_portal_mapping.sql"),
+            include_str!("../migrations/0003_token_resource_binding.sql"),
+            include_str!("../migrations/0004_invalidate_legacy_tokens.sql"),
+            include_str!("../migrations/0005_token_scopes.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("apply legacy migration");
+        }
+        sqlx::query(
+            "INSERT INTO tokens (mcp_access_token, arcgis_token, expires_at, portal_key, portal_url, portal_api_root, portal_apps, portal_stories_root, resource_uri, scope) \
+             VALUES ('old-access', '{}', 9999999999, 'portal', 'url', 'api', 'apps', 'stories', 'https://mcp.example.com/mcp', 'profile')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy access credential");
+        sqlx::query(
+            "INSERT INTO refresh_tokens (mcp_refresh_token, mcp_access_token, resource_uri, scope) \
+             VALUES ('old-refresh', 'old-access', 'https://mcp.example.com/mcp', 'profile')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy refresh credential");
+
+        sqlx::raw_sql(include_str!("../migrations/0006_stable_sessions.sql"))
+            .execute(&pool)
+            .await
+            .expect("apply stable session migration");
+
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("count sessions");
+        assert_eq!(sessions, 0);
+        assert!(
+            sqlx::query("SELECT * FROM tokens")
+                .fetch_all(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_arcgis_access_refreshes_preserve_refresh_credential() {
+        let (portal_url, requests) = mock_token_response_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "refreshed-arcgis-access",
+                "expires_in": 3600,
+                "username": "testuser",
+                "ssl": true,
+            }),
+        )
+        .await;
+        let store = test_store(&portal_url, "https://auth.example.com").await;
+        store_credential_family_for_portal(&store, &portal_url).await;
+
+        for _ in 0..2 {
+            sqlx::query("UPDATE sessions SET arcgis_access_expires_at = unixepoch() + 1")
+                .execute(&store.pool)
+                .await
+                .expect("expire ArcGIS access credential");
+            let resolved = store
+                .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+                .await
+                .into_active()
+                .expect("resolve refreshed session");
+            assert_eq!(
+                resolved.arcgis_token.access_token,
+                "refreshed-arcgis-access"
+            );
+        }
+
+        let refresh_token: String = sqlx::query_scalar("SELECT arcgis_refresh_token FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .expect("stored ArcGIS refresh credential");
+        assert_eq!(refresh_token, "arcgis-refresh-token");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_arcgis_failure_uses_only_safe_fallback_credentials() {
+        let (portal_url, requests) = mock_token_response_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": {"code": 503, "message": "unavailable"}}),
+        )
+        .await;
+        let store = test_store(&portal_url, "https://auth.example.com").await;
+        store_credential_family_for_portal(&store, &portal_url).await;
+
+        sqlx::query("UPDATE sessions SET arcgis_access_expires_at = unixepoch() + 60")
+            .execute(&store.pool)
+            .await
+            .expect("set safe fallback lifetime");
+        assert!(
+            store
+                .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+                .await
+                .into_active()
+                .is_some()
+        );
+
+        sqlx::query("UPDATE sessions SET arcgis_access_expires_at = unixepoch() + 20")
+            .execute(&store.pool)
+            .await
+            .expect("set unsafe fallback lifetime");
+        assert!(matches!(
+            store
+                .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+                .await,
+            super::SessionResolution::TemporarilyUnavailable
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn definitive_arcgis_refresh_rejection_revokes_session() {
+        let (portal_url, requests) = mock_token_response_server(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": {
+                    "code": 400,
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token expired"
+                }
+            }),
+        )
+        .await;
+        let store = test_store(&portal_url, "https://auth.example.com").await;
+        store_credential_family_for_portal(&store, &portal_url).await;
+        sqlx::query("UPDATE sessions SET arcgis_access_expires_at = unixepoch() + 1")
+            .execute(&store.pool)
+            .await
+            .expect("expire ArcGIS access credential");
+
+        assert!(matches!(
+            store
+                .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+                .await,
+            super::SessionResolution::Inactive
+        ));
+        let status: String = sqlx::query_scalar("SELECT status FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .expect("session status");
+        assert_eq!(status, "revoked");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn inactivity_and_absolute_deadlines_are_independent() {
+        let store = test_store("https://portal.example.com", "https://auth.example.com").await;
+        store_credential_family(&store).await;
+        sqlx::query(
+            "UPDATE sessions SET last_activity_at = unixepoch() - ?, absolute_expires_at = unixepoch() + 3600",
+        )
+        .bind(store.auth_settings.session_inactivity_timeout_seconds + 1)
+        .execute(&store.pool)
+        .await
+        .expect("expire session by inactivity");
+        assert!(matches!(
+            store
+                .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+                .await,
+            super::SessionResolution::Inactive
+        ));
+
+        sqlx::query(
+            "UPDATE sessions SET last_activity_at = unixepoch(), absolute_expires_at = unixepoch() - 1",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("expire session absolutely");
+        assert!(matches!(
+            store
+                .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+                .await,
+            super::SessionResolution::Inactive
+        ));
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_does_not_update_session_activity() {
+        let (portal_url, requests) = mock_token_response_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "forced-arcgis-access",
+                "expires_in": 3600,
+                "username": "testuser",
+                "ssl": true,
+            }),
+        )
+        .await;
+        let store = test_store(&portal_url, "https://auth.example.com").await;
+        store_credential_family_for_portal(&store, &portal_url).await;
+        sqlx::query("UPDATE sessions SET last_activity_at = unixepoch() - 100")
+            .execute(&store.pool)
+            .await
+            .expect("set activity timestamp");
+        let before: i64 = sqlx::query_scalar("SELECT last_activity_at FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .expect("activity before refresh");
+
+        let resolved = store
+            .force_refresh_session("mcp-access", "https://mcp.example.com/mcp")
+            .await
+            .into_active()
+            .expect("force refresh session");
+        let after: i64 = sqlx::query_scalar("SELECT last_activity_at FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .expect("activity after refresh");
+
+        assert_eq!(resolved.arcgis_token.access_token, "forced-arcgis-access");
+        assert_eq!(before, after);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_credential_exchange_does_not_extend_session_deadline() {
+        let (portal_url, requests) = mock_token_response_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "exchanged-arcgis-access",
+                "expires_in": 3600,
+                "refresh_token": "replacement-arcgis-refresh",
+                "refresh_token_expires_in": 1209600,
+                "username": "testuser",
+                "ssl": true,
+            }),
+        )
+        .await;
+        let store = test_store(&portal_url, "https://auth.example.com").await;
+        store_credential_family_for_portal(&store, &portal_url).await;
+        sqlx::query(
+            "UPDATE sessions SET arcgis_access_expires_at = unixepoch() + 1, \
+                    arcgis_refresh_expires_at = unixepoch() + 3600",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("age ArcGIS credentials");
+        let deadline_before: i64 = sqlx::query_scalar("SELECT absolute_expires_at FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .expect("deadline before exchange");
+
+        let resolved = store
+            .resolve_session("mcp-access", "https://mcp.example.com/mcp")
+            .await
+            .into_active()
+            .expect("resolve exchanged session");
+        let (refresh_token, deadline_after): (String, i64) =
+            sqlx::query_as("SELECT arcgis_refresh_token, absolute_expires_at FROM sessions")
+                .fetch_one(&store.pool)
+                .await
+                .expect("credentials after exchange");
+
+        assert_eq!(
+            resolved.arcgis_token.access_token,
+            "exchanged-arcgis-access"
+        );
+        assert_eq!(refresh_token, "replacement-arcgis-refresh");
+        assert_eq!(deadline_before, deadline_after);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_refreshes_are_single_flight_and_later_calls_are_limited() {
+        let (portal_url, requests) = mock_delayed_token_response_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "single-flight-access",
+                "expires_in": 3600,
+                "username": "testuser",
+                "ssl": true,
+            }),
+        )
+        .await;
+        let store = test_store(&portal_url, "https://auth.example.com").await;
+        store_credential_family_for_portal(&store, &portal_url).await;
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let first = tokio::spawn(async move {
+            first_store
+                .force_refresh_session("mcp-access", "https://mcp.example.com/mcp")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let second = tokio::spawn(async move {
+            second_store
+                .force_refresh_session("mcp-access", "https://mcp.example.com/mcp")
+                .await
+        });
+        let (first, second) = tokio::join!(first, second);
+
+        assert!(first.expect("first task").into_active().is_some());
+        assert!(second.expect("second task").into_active().is_some());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            store
+                .force_refresh_session("mcp-access", "https://mcp.example.com/mcp")
+                .await,
+            super::SessionResolution::RateLimited
+        ));
     }
 }

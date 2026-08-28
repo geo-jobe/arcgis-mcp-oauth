@@ -8,7 +8,9 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::arcgis_auth::{ArcGISAuthStore, ArcGISTokenResponse, PortalContext};
+use crate::arcgis_auth::{
+    ArcGISAccessTokenResponse, ArcGISAuthStore, PortalContext, SessionResolution,
+};
 use crate::oauth::routes::OAuthRouteState;
 
 #[derive(Clone)]
@@ -23,7 +25,7 @@ struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    arcgis_token: Option<ArcGISTokenResponse>,
+    arcgis_token: Option<ArcGISAccessTokenResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     portal: Option<PortalContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,19 +133,22 @@ pub async fn internal_session(
     };
 
     let store: &ArcGISAuthStore = &state.oauth.arcgis_store;
-    match store.get_token(mcp_token, &resource).await {
-        Some(record) => (
-            StatusCode::OK,
-            Json(SessionResponse {
-                active: true,
-                expires_at: Some(record.expires_at),
-                arcgis_token: Some(record.arcgis_token),
-                portal: Some(record.portal),
-                resource: Some(record.resource),
-                scopes: Some(record.scopes),
-            }),
-        ),
-        None => (
+    match store.resolve_session(mcp_token, &resource).await {
+        SessionResolution::Active(record) => {
+            let record = *record;
+            (
+                StatusCode::OK,
+                Json(SessionResponse {
+                    active: true,
+                    expires_at: Some(record.expires_at),
+                    arcgis_token: Some(record.arcgis_token),
+                    portal: Some(record.portal),
+                    resource: Some(record.resource),
+                    scopes: Some(record.scopes),
+                }),
+            )
+        }
+        SessionResolution::Inactive => (
             StatusCode::NOT_FOUND,
             Json(SessionResponse {
                 active: false,
@@ -154,7 +159,93 @@ pub async fn internal_session(
                 scopes: None,
             }),
         ),
+        SessionResolution::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SessionResponse {
+                active: false,
+                expires_at: None,
+                arcgis_token: None,
+                portal: None,
+                resource: None,
+                scopes: None,
+            }),
+        ),
+        SessionResolution::RateLimited => empty_session_response(StatusCode::TOO_MANY_REQUESTS),
     }
+}
+
+pub async fn internal_session_refresh(
+    State(state): State<Arc<InternalRouteState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let provided_key = match extract_internal_key(&headers) {
+        Some(key) => key,
+        None => return empty_session_response(StatusCode::UNAUTHORIZED),
+    };
+    if !constant_time_eq(provided_key, state.internal_api_key.as_str()) {
+        return empty_session_response(StatusCode::UNAUTHORIZED);
+    }
+    let mcp_token = match extract_mcp_token(&headers) {
+        Some(token) if !token.is_empty() => token,
+        _ => return empty_session_response(StatusCode::BAD_REQUEST),
+    };
+    let resource = match extract_resource(&headers)
+        .and_then(|value| crate::oauth::store::canonical_resource_uri(value).ok())
+    {
+        Some(resource) => resource,
+        None => return empty_session_response(StatusCode::BAD_REQUEST),
+    };
+
+    tracing::info_span!("internal.session.force_refresh").in_scope(
+        || tracing::info!(resource = %resource, "forcing ArcGIS access credential refresh"),
+    );
+    session_resolution_response(
+        state
+            .oauth
+            .arcgis_store
+            .force_refresh_session(mcp_token, &resource)
+            .await,
+    )
+}
+
+fn session_resolution_response(
+    resolution: SessionResolution,
+) -> (StatusCode, Json<SessionResponse>) {
+    match resolution {
+        SessionResolution::Active(record) => {
+            let record = *record;
+            (
+                StatusCode::OK,
+                Json(SessionResponse {
+                    active: true,
+                    expires_at: Some(record.expires_at),
+                    arcgis_token: Some(record.arcgis_token),
+                    portal: Some(record.portal),
+                    resource: Some(record.resource),
+                    scopes: Some(record.scopes),
+                }),
+            )
+        }
+        SessionResolution::Inactive => empty_session_response(StatusCode::NOT_FOUND),
+        SessionResolution::TemporarilyUnavailable => {
+            empty_session_response(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        SessionResolution::RateLimited => empty_session_response(StatusCode::TOO_MANY_REQUESTS),
+    }
+}
+
+fn empty_session_response(status: StatusCode) -> (StatusCode, Json<SessionResponse>) {
+    (
+        status,
+        Json(SessionResponse {
+            active: false,
+            expires_at: None,
+            arcgis_token: None,
+            portal: None,
+            resource: None,
+            scopes: None,
+        }),
+    )
 }
 
 #[cfg(test)]

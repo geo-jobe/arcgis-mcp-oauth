@@ -19,7 +19,7 @@ use tower_http::cors::{Any as CorsAny, CorsLayer};
 
 use crate::arcgis_auth::{ArcGISAuthStore, arcgis_callback};
 use crate::config::Settings;
-use crate::internal::{InternalRouteState, internal_session};
+use crate::internal::{InternalRouteState, internal_session, internal_session_refresh};
 use crate::oauth::client_metadata::ClientMetadataPolicy;
 use crate::oauth::routes::{
     OAuthRouteState, oauth_authorization_server, oauth_authorize, oauth_authorize_continue,
@@ -109,10 +109,11 @@ pub async fn run(settings: Settings, internal_api_key: String) {
             allow_private_addresses: settings.cimd_allow_private_addresses,
         },
     ));
-    let arcgis_store = Arc::new(ArcGISAuthStore::new(
+    let arcgis_store = Arc::new(ArcGISAuthStore::with_auth_settings(
         pool,
         public_base_url.clone(),
         portal_registry,
+        settings.auth.clone(),
     ));
 
     let sweep_store = arcgis_store.clone();
@@ -151,6 +152,7 @@ pub async fn run(settings: Settings, internal_api_key: String) {
 
     let internal_router = Router::new()
         .route("/internal/session", get(internal_session))
+        .route("/internal/session/refresh", post(internal_session_refresh))
         .with_state(internal_state);
 
     let router = Router::new()

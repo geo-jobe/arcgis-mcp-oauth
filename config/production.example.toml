@@ -3,6 +3,14 @@ port = 3324
 public_base_url = "https://auth.example.com"
 cimd_allow_private_addresses = false
 
+[auth]
+mcp_access_token_lifetime_seconds = 3600
+session_max_age_seconds = 7776000
+session_inactivity_timeout_seconds = 2592000
+mcp_refresh_replay_window_seconds = 30
+arcgis_access_refresh_buffer_seconds = 300
+arcgis_refresh_renewal_buffer_seconds = 86400
+
 # Replace this example with each ArcGIS portal that this deployment supports.
 [[arcgis_portals]]
 key = "example-arcgis-online"
