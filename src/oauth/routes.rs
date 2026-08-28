@@ -249,7 +249,7 @@ pub async fn oauth_authorize(
     };
 
     match template.render() {
-        Ok(html) => consent_page_response(html),
+        Ok(html) => consent_page_response(html, state.arcgis_store.portal_registry().list()),
         Err(e) => {
             tracing::error!("failed to render authorize template: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -369,14 +369,23 @@ fn valid_pkce_challenge(challenge: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
-fn consent_page_response(html: String) -> axum::response::Response {
+fn consent_page_response(html: String, portals: &[ArcgisPortalConfig]) -> axum::response::Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let portal_origins = portals
+        .iter()
+        .filter_map(|portal| url::Url::parse(&portal.portal_url).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let content_security_policy = format!(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {portal_origins}; frame-ancestors 'none'; base-uri 'none'"
+    );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-        ),
+        HeaderValue::from_str(&content_security_policy)
+            .expect("URL origins must produce a valid CSP header"),
     );
     headers.insert(
         header::REFERRER_POLICY,
@@ -1195,12 +1204,10 @@ mod tests {
         .into_response();
         assert_eq!(page.status(), StatusCode::OK);
         assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
-        assert!(
-            page.headers()[header::CONTENT_SECURITY_POLICY]
-                .to_str()
-                .expect("CSP")
-                .contains("form-action 'self'")
-        );
+        let content_security_policy = page.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .expect("CSP");
+        assert!(content_security_policy.contains("form-action 'self' https://portal.example.com;"));
         let html = String::from_utf8(
             to_bytes(page.into_body(), 32_768)
                 .await
